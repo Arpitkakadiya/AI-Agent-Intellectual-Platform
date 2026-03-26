@@ -9,7 +9,6 @@ from tests.conftest import DALLAS_JURISDICTION_ID
 
 
 def _fake_embed(_text: str) -> list[float]:
-    # Deterministic dummy embedding vector.
     return [0.1, 0.2, 0.3]
 
 
@@ -57,10 +56,9 @@ def test_esa_query_returns_non_empty_answer(
 def test_answer_never_returns_empty_string(
     mock_supabase_client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Even when vector search returns zero results, answer must be a non-empty fallback string, not '' or None"""
+    """Even when vector search returns zero results, answer must be a non-empty fallback string"""
     mock_supabase_client.set_match_regulations_override(lambda _payload: [])
 
-    # Force the QA system to use its rule-based / no-LLM fallback path.
     _configure_llm(monkeypatch, ai_available=False, ask_return=None)
 
     result = _qa_mod.qa.answer_question(
@@ -96,13 +94,11 @@ def test_jurisdiction_scoping_dallas_excludes_houston(
 def test_rule_based_fallback_works_with_no_api_keys(
     mock_supabase_client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When ANTHROPIC_API_KEY, OPENAI_API_KEY, and GOOGLE_API_KEY are all unset,
-    the system must still return a valid non-empty answer using the rule-based engine"""
+    """When all API keys are unset, the system must still return a valid non-empty answer"""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
 
-    # Ensure the LLM path is not used at all.
     _configure_llm(monkeypatch, ai_available=False, ask_return=None)
 
     result = _qa_mod.qa.answer_question(
@@ -114,4 +110,56 @@ def test_rule_based_fallback_works_with_no_api_keys(
     assert isinstance(result["answer"], str)
     assert result["answer"].strip() != ""
     assert "no llm api key" in result["answer"].lower()
+
+
+# -----------------------------------------------------------------------
+# New tests for upgraded RAG pipeline
+# -----------------------------------------------------------------------
+
+
+def test_answer_includes_confidence_field(
+    mock_supabase_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Upgraded pipeline must return a 'confidence' field in the response."""
+    _configure_llm(
+        monkeypatch, ai_available=True, ask_return="Grounded ESA answer."
+    )
+
+    result = _qa_mod.qa.answer_question(
+        "What are the ESA rules for a landlord in Dallas, TX?",
+        chat_history=[],
+        jurisdiction_id=DALLAS_JURISDICTION_ID,
+    )
+    assert "confidence" in result
+    assert result["confidence"] in ("grounded", "weak_evidence", "conflicting", "out_of_scope")
+
+
+def test_out_of_scope_returns_confidence_out_of_scope(
+    mock_supabase_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Out-of-scope questions should return confidence='out_of_scope'."""
+    result = _qa_mod.qa.answer_question(
+        "What is the best pizza in NYC?",
+        chat_history=[],
+    )
+    assert result.get("confidence") == "out_of_scope"
+
+
+def test_reranking_preserves_top_results(
+    mock_supabase_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After reranking, the most relevant Dallas result should still appear."""
+    _configure_llm(
+        monkeypatch, ai_available=True, ask_return="Reranked answer."
+    )
+
+    result = _qa_mod.qa.answer_question(
+        "What are the ESA rules in Dallas, TX?",
+        chat_history=[],
+        jurisdiction_id=DALLAS_JURISDICTION_ID,
+    )
+    sources = result.get("sources") or []
+    assert len(sources) >= 1
+    source_names = [str(s.get("source") or "") for s in sources]
+    assert any("Dallas" in name for name in source_names)
 

@@ -1,0 +1,123 @@
+[
+  {
+    "id": "esa_dallas_basic",
+    "question": "What are the ESA rules for landlords in Dallas, TX?",
+    "jurisdiction_id": null,
+    "expected": {
+      "should_retrieve_from": ["Dallas", "Texas", "Federal"],
+      "must_mention_sources": ["Fair Housing Act", "HUD"],
+      "must_mention_topics": ["emotional support animal", "reasonable accommodation", "pet fee"],
+      "jurisdiction_must_match": "TX",
+      "should_not_hallucinate": ["specific dollar amounts unless sourced", "made-up statute numbers"]
+    }
+  },
+  {
+    "id": "esa_federal_only",
+    "question": "What does federal law say about emotional support animals in rental housing?",
+    "jurisdiction_id": null,
+    "expected": {
+      "should_retrieve_from": ["Federal"],
+      "must_mention_sources": ["Fair Housing Act", "HUD"],
+      "must_mention_topics": ["assistance animal", "reasonable accommodation", "disability"],
+      "jurisdiction_must_match": "federal",
+      "should_not_hallucinate": []
+    }
+  },
+  {
+    "id": "rent_control_ca",
+    "question": "Does California have rent control laws?",
+    "jurisdiction_id": null,
+    "expected": {
+      "should_retrieve_from": ["California"],
+      "must_mention_sources": [],
+      "must_mention_topics": ["rent control", "rent stabilization"],
+      "jurisdiction_must_match": "CA",
+      "should_not_hallucinate": []
+    }
+  },
+  {
+    "id": "security_deposit_tx",
+    "question": "What are the security deposit rules in Texas?",
+    "jurisdiction_id": null,
+    "expected": {
+      "should_retrieve_from": ["Texas"],
+      "must_mention_sources": ["Texas Property Code"],
+      "must_mention_topics": ["security deposit", "return", "deduction"],
+      "jurisdiction_must_match": "TX",
+      "should_not_hallucinate": []
+    }
+  },
+  {
+    "id": "cross_jurisdiction_compare",
+    "question": "Compare ESA rules in California vs Texas",
+    "jurisdiction_id": null,
+    "expected": {
+      "should_retrieve_from": ["California", "Texas", "Federal"],
+      "must_mention_sources": ["Fair Housing Act"],
+      "must_mention_topics": ["ESA", "assistance animal", "comparison"],
+      "jurisdiction_must_match": null,
+      "should_not_hallucinate": []
+    }
+  },
+  {
+    "id": "out_of_scope",
+    "question": "What is the best pizza restaurant in New York?",
+    "jurisdiction_id": null,
+    "expected": {
+      "should_retrieve_from": [],
+      "must_mention_sources": [],
+      "must_mention_topics": [],
+      "jurisdiction_must_match": null,
+      "should_be_out_of_scope": true,
+      "should_not_hallucinate": []
+    }
+  },
+  {
+    "id": "eviction_process_ny",
+    "question": "What is the eviction process in New York?",
+    "jurisdiction_id": null,
+    "expected": {
+      "should_retrieve_from": ["New York"],
+      "must_mention_sources": [],
+      "must_mention_topics": ["eviction", "notice", "tenant"],
+      "jurisdiction_must_match": "NY",
+      "should_not_hallucinate": []
+    }
+  },
+  {
+    "id": "section_number_lookup",
+    "question": "What does Section 504 of the Rehabilitation Act require for housing?",
+    "jurisdiction_id": null,
+    "expected": {
+      "should_retrieve_from": ["Federal"],
+      "must_mention_sources": ["Rehabilitation Act", "Section 504"],
+      "must_mention_topics": ["disability", "federal funding", "accessibility"],
+      "jurisdiction_must_match": "federal",
+      "should_not_hallucinate": []
+    }
+  },
+  {
+    "id": "habitability_general",
+    "question": "What are the implied warranty of habitability requirements?",
+    "jurisdiction_id": null,
+    "expected": {
+      "should_retrieve_from": [],
+      "must_mention_sources": [],
+      "must_mention_topics": ["habitability", "repair", "landlord obligation"],
+      "jurisdiction_must_match": null,
+      "should_not_hallucinate": []
+    }
+  },
+  {
+    "id": "pet_policy_city",
+    "question": "What are the pet deposit rules in San Francisco?",
+    "jurisdiction_id": null,
+    "expected": {
+      "should_retrieve_from": ["San Francisco", "California"],
+      "must_mention_sources": [],
+      "must_mention_topics": ["pet", "deposit"],
+      "jurisdiction_must_match": "CA",
+      "should_not_hallucinate": []
+    }
+  }
+]

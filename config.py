@@ -20,6 +20,14 @@ class Settings(BaseSettings):
     SMTP_HOST: Optional[str] = None
     SMTP_PORT: Optional[str] = None
 
+    # --- RAG pipeline tuning ---
+    RAG_HYBRID_ENABLED: bool = True
+    RAG_HYBRID_VECTOR_WEIGHT: float = 0.6
+    RAG_RETRIEVAL_TOP_N: int = 15
+    RAG_RERANK_TOP_K: int = 5
+    RAG_LLM_RERANK_ENABLED: bool = False
+    RAG_USE_LEGAL_CHUNKING: bool = True
+
     LEGAL_DISCLAIMER: str = (
         "⚠️ This tool is for informational purposes only. It is not legal advice. "
         "Consult qualified legal counsel before making decisions."
