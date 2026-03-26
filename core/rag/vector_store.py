@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from config import CHUNK_OVERLAP, CHUNK_SIZE, MAX_CONTEXT_CHARS
+
 from pydantic import BaseModel
 
 from core.llm.client import llm
@@ -15,13 +17,17 @@ class SearchResult(BaseModel):
     row_id: Optional[int] = None
 
 
-def _chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> list[str]:
+def _chunk_text(
+    text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP
+) -> list[str]:
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
     if overlap < 0:
         raise ValueError("overlap must be >= 0")
     if overlap >= chunk_size:
         raise ValueError("overlap must be < chunk_size")
+    if chunk_size > MAX_CONTEXT_CHARS:
+        raise ValueError("chunk_size must be <= MAX_CONTEXT_CHARS")
 
     t = text or ""
     if not t:
@@ -60,7 +66,7 @@ class RegulationVectorStore:
         for doc in docs:
             text = str(doc.get("text") or "")
             regulation_id = int(doc["regulation_id"])
-            for chunk in _chunk_text(text, chunk_size=800, overlap=100):
+            for chunk in _chunk_text(text):
                 embedding = llm.embed(chunk)
                 rows.append(
                     {

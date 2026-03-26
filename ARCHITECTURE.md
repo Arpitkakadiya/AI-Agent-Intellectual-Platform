@@ -1,14 +1,28 @@
 # Compliance Agent — Architecture
 
 ## Stack
-- Python 3.11
-- Streamlit (multi-page via pages/ folder)
-- Supabase (Postgres + pgvector for vector search)
-- Anthropic Claude (claude-sonnet-4-20250514) as primary LLM
-- OpenAI as fallback LLM if no Anthropic key
-- Rule-based engine as final fallback (no API key needed)
-- Pydantic v2 for all data models
-- GitHub Actions for scheduled scraping
+Python 3.11
+Streamlit (multi-page via pages/ folder)
+Supabase (Postgres + pgvector for vector search)
+Anthropic Claude claude-sonnet-4-20250514 — primary LLM (ANTHROPIC_API_KEY)
+OpenAI GPT-4o — fallback LLM if no Anthropic key (OPENAI_API_KEY)
+Google Gemini — second fallback LLM + default embedding provider (GOOGLE_API_KEY)
+Embeddings: Google Gemini (default) or OpenAI text-embedding-3-small — switchable via EMBED_PROVIDER in .env
+Rule-based engine (core/compliance/rules.py) — final fallback, works with no API key
+Pydantic v2 for all data models
+GitHub Actions for scheduled scraping
+
+## LLM fallback order
+
+Check settings.has_anthropic_key → use Anthropic Claude
+Else check settings.has_openai_key → use OpenAI GPT-4o
+Else check settings.has_google_key → use Google Gemini
+Else → rule-based engine in core/compliance/rules.py (no API key required)
+
+Embeddings use EMBED_PROVIDER from .env:
+
+"gemini" (default) → Google text-embedding via google-genai SDK
+"openai" → text-embedding-3-small via openai SDK
 
 ## Folder structure
 compliance-agent/
