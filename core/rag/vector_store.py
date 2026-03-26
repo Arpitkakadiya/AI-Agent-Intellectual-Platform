@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
-from config import CHUNK_OVERLAP, CHUNK_SIZE, MAX_CONTEXT_CHARS
+from config import CHUNK_OVERLAP, CHUNK_SIZE, MAX_CONTEXT_CHARS, settings
 
 from pydantic import BaseModel
 
 from core.llm.client import llm
 from db.client import get_db
+
+logger = logging.getLogger(__name__)
 
 
 class SearchResult(BaseModel):
@@ -17,9 +20,26 @@ class SearchResult(BaseModel):
     row_id: Optional[int] = None
 
 
+# ---------------------------------------------------------------------------
+# Backward-compatible chunking entry point
+# ---------------------------------------------------------------------------
+
 def _chunk_text(
     text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP
 ) -> list[str]:
+    """Chunk text using legal-aware splitter when enabled, else sliding window."""
+    if settings.RAG_USE_LEGAL_CHUNKING:
+        from core.rag.chunking import chunk_legal_text
+        pairs = chunk_legal_text(text, chunk_size=chunk_size, overlap=overlap)
+        return [chunk for chunk, _meta in pairs]
+
+    return _sliding_window_chunk(text, chunk_size, overlap)
+
+
+def _sliding_window_chunk(
+    text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP
+) -> list[str]:
+    """Original character-level sliding window (preserved for fallback)."""
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
     if overlap < 0:
@@ -33,7 +53,6 @@ def _chunk_text(
     if not t:
         return []
 
-    # If the whole text fits into one chunk, don't split it further (even if overlap is large).
     if len(t) <= chunk_size:
         cleaned = t.strip()
         return [cleaned] if cleaned else []
@@ -60,12 +79,10 @@ class RegulationVectorStore:
 
         db = get_db()
 
-        # Replace semantics: delete old embeddings for any affected regulation_ids.
         regulation_ids: list[int] = sorted(
             {int(d["regulation_id"]) for d in docs if "regulation_id" in d}
         )
         if regulation_ids:
-            # Batched delete to keep SQL statements small and avoid statement timeouts.
             delete_batch_size: int = 500
             for i in range(0, len(regulation_ids), delete_batch_size):
                 batch_ids = regulation_ids[i : i + delete_batch_size]
@@ -90,7 +107,6 @@ class RegulationVectorStore:
         if not rows:
             return
 
-        # Batch insert (acts like upsert due to delete+insert above).
         batch_size = 100
         for i in range(0, len(rows), batch_size):
             db.table("regulation_embeddings").insert(rows[i : i + batch_size]).execute()
@@ -103,6 +119,7 @@ class RegulationVectorStore:
         query_embedding: list[float] | None = None,
         category_filter: str | None = None,
     ) -> list[SearchResult]:
+        """Single-jurisdiction vector search (backward compatible, uses v2 RPC)."""
         db = get_db()
 
         qemb = query_embedding if query_embedding is not None else llm.embed(query)
@@ -112,11 +129,44 @@ class RegulationVectorStore:
             "filter_jurisdiction": jurisdiction_id,
             "category_filter": category_filter,
         }
-        # Use the v2 RPC to reduce scan cost and avoid statement timeouts.
         res = db.rpc("match_regulations_v2", payload).execute()
 
+        return self._parse_vector_results(res.data)
+
+    def search_v3(
+        self,
+        query: str,
+        n_results: int = 10,
+        jurisdiction_ids: list[int] | None = None,
+        query_embedding: list[float] | None = None,
+        category_filter: str | None = None,
+    ) -> list[SearchResult]:
+        """Multi-jurisdiction vector search using v3 RPC with explicit ID array."""
+        db = get_db()
+
+        qemb = query_embedding if query_embedding is not None else llm.embed(query)
+        payload: dict[str, Any] = {
+            "query_embedding": qemb,
+            "match_count": int(n_results),
+            "filter_jurisdictions": jurisdiction_ids,
+            "category_filter": category_filter,
+        }
+        try:
+            res = db.rpc("match_regulations_v3", payload).execute()
+            return self._parse_vector_results(res.data)
+        except Exception:
+            logger.debug("v3 RPC unavailable, falling back to v2 per-jurisdiction")
+            all_hits: list[SearchResult] = []
+            for jid in (jurisdiction_ids or [None]):
+                all_hits.extend(
+                    self.search(query, n_results, jid, qemb, category_filter)
+                )
+            return all_hits
+
+    @staticmethod
+    def _parse_vector_results(data: list[dict[str, Any]] | None) -> list[SearchResult]:
         out: list[SearchResult] = []
-        for row in res.data or []:
+        for row in data or []:
             rid = row.get("id")
             out.append(
                 SearchResult(

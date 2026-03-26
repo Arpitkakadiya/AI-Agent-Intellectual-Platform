@@ -79,15 +79,31 @@ class FakeSupabaseClient:
         # Function name is ignored; this stub is only for match_regulations.
         return _RPCQuery(client=self, payload=payload)
 
+    # Jurisdiction rows used for ID-based lookups (build_retrieval_plan)
+    _JURISDICTION_ROWS: list[dict[str, Any]] = [
+        {"id": FEDERAL_ID, "type": "federal", "name": "Federal Government", "parent_id": None, "state_code": None},
+        {"id": TX_STATE_ID, "type": "state", "name": "Texas", "parent_id": FEDERAL_ID, "state_code": "TX"},
+        {"id": DALLAS_JURISDICTION_ID, "type": "city", "name": "Dallas", "parent_id": TX_STATE_ID, "state_code": "TX"},
+        {"id": HOUSTON_JURISDICTION_ID, "type": "city", "name": "Houston", "parent_id": TX_STATE_ID, "state_code": "TX"},
+    ]
+
     def _execute_table_query(
         self, table_name: str, filters: dict[str, Any]
     ) -> _ExecuteResult:
         if table_name != "jurisdictions":
             return _ExecuteResult(data=[])
 
+        # ID-based lookup (used by jurisdiction.py's _lookup_jurisdiction)
+        if "id" in filters:
+            fid = int(filters["id"])
+            for row in self._JURISDICTION_ROWS:
+                if row["id"] == fid:
+                    return _ExecuteResult(data=[row])
+            return _ExecuteResult(data=[])
+
         row_type = filters.get("type")
         if row_type == "federal":
-            return _ExecuteResult(data=[{"id": FEDERAL_ID}])
+            return _ExecuteResult(data=[{"id": FEDERAL_ID, "name": "Federal Government"}])
 
         if row_type == "state":
             state_code = filters.get("state_code")
@@ -96,7 +112,6 @@ class FakeSupabaseClient:
                 return _ExecuteResult(data=[{"id": TX_STATE_ID}])
             if isinstance(state_name, str) and state_name.strip().lower() == "texas":
                 return _ExecuteResult(data=[{"id": TX_STATE_ID}])
-            # Unknown state name/code -> empty.
             return _ExecuteResult(data=[])
 
         return _ExecuteResult(data=[])
@@ -129,6 +144,7 @@ class FakeSupabaseClient:
                 "url": "https://example.com/dallas-esa",
                 "category": "Fair Housing",
                 "domain": "tx",
+                "jurisdiction_id": DALLAS_JURISDICTION_ID,
             },
             "similarity": 0.91,
         }
@@ -149,6 +165,7 @@ class FakeSupabaseClient:
                 "url": "https://example.com/houston-esa",
                 "category": "Fair Housing",
                 "domain": "tx",
+                "jurisdiction_id": HOUSTON_JURISDICTION_ID,
             },
             "similarity": 0.85,
         }
@@ -176,7 +193,8 @@ def mock_supabase_client(monkeypatch: pytest.MonkeyPatch) -> FakeSupabaseClient:
     """
     Provide a mock Supabase client and patch get_db() across RAG modules.
 
-    This ensures qa_system / vector_store never reach the real Supabase.
+    This ensures qa_system / vector_store / jurisdiction / hybrid never reach
+    the real Supabase.
     """
 
     client = FakeSupabaseClient()
@@ -186,12 +204,40 @@ def mock_supabase_client(monkeypatch: pytest.MonkeyPatch) -> FakeSupabaseClient:
 
     monkeypatch.setattr(_db_client, "get_db", lambda: client)
 
-    # Patch already-imported get_db references.
+    # Patch already-imported get_db references in all RAG modules.
     import core.rag.qa_system as _qa_mod
     import core.rag.vector_store as _vs_mod
 
     monkeypatch.setattr(_qa_mod, "get_db", lambda: client)
     monkeypatch.setattr(_vs_mod, "get_db", lambda: client)
+
+    # Patch new modules that also import get_db
+    try:
+        import core.rag.jurisdiction as _jur_mod
+        monkeypatch.setattr(_jur_mod, "get_db", lambda: client)
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        import core.rag.hybrid as _hyb_mod
+        monkeypatch.setattr(_hyb_mod, "get_db", lambda: client)
+    except (ImportError, AttributeError):
+        pass
+
+    # Disable hybrid search in tests by default (avoids lexical RPC calls).
+    # Patch via all known import paths to ensure consistency.
+    try:
+        import config as _cfg
+        monkeypatch.setattr(_cfg.settings, "RAG_HYBRID_ENABLED", False)
+        monkeypatch.setattr(_cfg.settings, "RAG_RETRIEVAL_TOP_N", 5)
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        monkeypatch.setattr(_qa_mod.settings, "RAG_HYBRID_ENABLED", False)
+        monkeypatch.setattr(_qa_mod.settings, "RAG_RETRIEVAL_TOP_N", 5)
+    except (ImportError, AttributeError):
+        pass
 
     return client
 
