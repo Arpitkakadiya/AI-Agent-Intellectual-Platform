@@ -66,6 +66,12 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+# RAG pipeline constants — used by core/rag/vector_store.py and core/rag/qa_system.py
+CHUNK_SIZE: int = 800          # characters per text chunk when indexing
+CHUNK_OVERLAP: int = 200       # overlap between consecutive chunks (sliding window)
+MAX_CONTEXT_CHARS: int = 4000  # max total characters passed to LLM as context (~1000 tokens)
+EMBEDDING_DIMS: int = 1536     # vector dimensions (matches regulation_embeddings table)
+
 # Canonical, stable import path used across the app.
 LEGAL_DISCLAIMER: str = settings.LEGAL_DISCLAIMER
 
