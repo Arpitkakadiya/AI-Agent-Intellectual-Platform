@@ -72,6 +72,9 @@ TEXAS_CITIES: Final[list[str]] = [
     "Fort Worth",
 ]
 
+FEDERAL_NAME: Final[str] = "United States"
+FEDERAL_LEGACY_NAMES: Final[list[str]] = ["Federal Government", FEDERAL_NAME]
+
 
 def _get_federal_id() -> int:
     db = get_db()
@@ -79,7 +82,7 @@ def _get_federal_id() -> int:
         db.table("jurisdictions")
         .select("id")
         .eq("type", "federal")
-        .eq("name", "Federal Government")
+        .in_("name", FEDERAL_LEGACY_NAMES)
         .limit(1)
         .execute()
     )
@@ -111,15 +114,17 @@ def main() -> None:
         db.table("jurisdictions")
         .select("id")
         .eq("type", "federal")
-        .eq("name", "Federal Government")
+        .in_("name", FEDERAL_LEGACY_NAMES)
         .limit(1)
         .execute()
     )
     if not existing_federal.data:
         db.table("jurisdictions").insert(
-            [{"type": "federal", "name": "Federal Government", "parent_id": None}]
+            [{"type": "federal", "name": FEDERAL_NAME, "parent_id": None}]
         ).execute()
     federal_id = _get_federal_id()
+    # Normalize to the required name so downstream lookups are stable.
+    db.table("jurisdictions").update({"name": FEDERAL_NAME}).eq("id", federal_id).execute()
 
     # 2) 50 states (check-then-insert to avoid needing unique constraints)
     for code, name in sorted(US_STATES.items()):
@@ -132,6 +137,11 @@ def main() -> None:
             .execute()
         )
         if existing_state.data:
+            if code == "TX":
+                # Ensure Texas has the required name + parent relationship.
+                db.table("jurisdictions").update({"name": "Texas", "parent_id": federal_id}).eq(
+                    "id", int(existing_state.data[0]["id"])
+                ).execute()
             continue
 
         db.table("jurisdictions").insert(
@@ -158,10 +168,14 @@ def main() -> None:
             .execute()
         )
         if existing_city.data:
+            # Ensure state_code is set for the TX-city lookup used by seed_db.py.
+            db.table("jurisdictions").update({"state_code": "TX"}).eq(
+                "id", int(existing_city.data[0]["id"])
+            ).execute()
             continue
 
         db.table("jurisdictions").insert(
-            [{"type": "city", "name": city, "parent_id": texas_id}]
+            [{"type": "city", "name": city, "parent_id": texas_id, "state_code": "TX"}]
         ).execute()
 
     # 6) Print progress

@@ -83,9 +83,37 @@ CITY_TO_STATE_CODE: dict[str, str] = {
     "Fort Worth": "TX",
 }
 
+FEDERAL_NAME_ALIASES: dict[str, str] = {
+    "Federal Government": "United States",
+    "United States": "United States",
+}
+CODE_TO_STATE_NAME: dict[str, str] = {code: name for name, code in STATE_NAME_TO_CODE.items()}
+
 
 def _sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _infer_state_code(city_name: str) -> str | None:
+    """
+    Best-effort state_code inference for backward compatibility.
+    Prefer using the CSV `state_code` column when present.
+    """
+    label = (city_name or "").strip()
+    if not label:
+        return None
+
+    if label.lower().endswith("-statewide"):
+        # Example: "California-Statewide" -> "California"
+        state_part = label.split("-", 1)[0].strip()
+        state_part = state_part.replace("NewYork", "New York")
+        return STATE_NAME_TO_CODE.get(state_part)
+
+    if label in STATE_NAME_TO_CODE:
+        return STATE_NAME_TO_CODE[label]
+
+    # City name fallback.
+    return CITY_TO_STATE_CODE.get(label)
 
 
 def _get_state_id_by_code(db: Any, state_code: str) -> int:
@@ -105,11 +133,12 @@ def _get_state_id_by_code(db: Any, state_code: str) -> int:
 
 
 def _get_federal_id(db: Any) -> int:
+    # Some earlier seeds used "Federal Government" vs "United States".
     res = (
         db.table("jurisdictions")
         .select("id")
         .eq("type", "federal")
-        .eq("name", "Federal Government")
+        .in_("name", list(FEDERAL_NAME_ALIASES.keys()))
         .limit(1)
         .execute()
     )
@@ -120,41 +149,62 @@ def _get_federal_id(db: Any) -> int:
     return int(res.data[0]["id"])
 
 
-def _resolve_jurisdiction_id(db: Any, category: str, city_name: str) -> int:
+def _resolve_jurisdiction_id(
+    db: Any, category: str, city_name: str, state_code: str
+) -> int:
     kind = (category or "").strip().lower()
     label = (city_name or "").strip()
+    code = (state_code or "").strip().upper()
 
     if kind == "federal":
         return _get_federal_id(db)
 
     if kind == "state":
-        state_part = label.split("-", 1)[0].strip()
-        state_part = state_part.replace("NewYork", "New York")
-        state_code = STATE_NAME_TO_CODE.get(state_part)
-        if not state_code:
-            raise RuntimeError(f"Cannot map state name '{state_part}' to a state code.")
-        return _get_state_id_by_code(db, state_code)
+        if not code:
+            raise RuntimeError("Missing state_code for state jurisdiction row.")
+        return _get_state_id_by_code(db, code)
 
     if kind == "city":
+        if not code:
+            raise RuntimeError("Missing state_code for city jurisdiction row.")
         city_res = (
             db.table("jurisdictions")
             .select("id")
             .eq("type", "city")
             .eq("name", label)
+            .eq("state_code", code)
             .limit(1)
             .execute()
         )
         if city_res.data:
             return int(city_res.data[0]["id"])
+        # Fallback: if city jurisdictions aren't seeded for every state, use the state scope.
+        return _get_state_id_by_code(db, code)
 
-        state_code = CITY_TO_STATE_CODE.get(label)
-        if not state_code:
-            raise RuntimeError(
-                f"City '{label}' not found in jurisdictions and no fallback mapping exists."
-            )
-        return _get_state_id_by_code(db, state_code)
+    # Regulation-category rows (e.g. "Renters", "Pet Policy", "ESA") use `city_name` + `state_code`
+    # to decide whether the target jurisdiction is a city or a state.
+    if not code:
+        raise RuntimeError(
+            f"Missing state_code for regulation row category='{category}', city_name='{label}'."
+        )
 
-    raise RuntimeError(f"Unknown category '{category}'. Expected Federal/State/City.")
+    expected_state_name = CODE_TO_STATE_NAME.get(code)
+    if expected_state_name and label.lower() == expected_state_name.lower():
+        return _get_state_id_by_code(db, code)
+
+    city_res = (
+        db.table("jurisdictions")
+        .select("id")
+        .eq("type", "city")
+        .eq("name", label)
+        .eq("state_code", code)
+        .limit(1)
+        .execute()
+    )
+    if city_res.data:
+        return int(city_res.data[0]["id"])
+    # Fallback: if city jurisdictions aren't seeded for this state, fall back to the state scope.
+    return _get_state_id_by_code(db, code)
 
 
 # ---------------------------------------------------------------------------
@@ -178,26 +228,37 @@ def load_regulations_from_csv(csv_path: Path) -> dict[str, Any]:
             if not url:
                 continue
 
-            existing_current_res = (
-                db.table("regulations")
-                .select("id,content_hash,version")
-                .eq("url", url)
-                .eq("is_current", True)
-                .limit(1)
-                .execute()
-            )
-            existing_current = (
-                existing_current_res.data[0] if existing_current_res.data else None
-            )
-
             category = (row.get("category") or "").strip()
             city_name = (row.get("city_name") or "").strip()
             law_name = (row.get("law_name") or "").strip()
+            state_code = (row.get("state_code") or "").strip().upper()
+            if not state_code:
+                state_code = _infer_state_code(city_name)
+            if not state_code:
+                raise RuntimeError(
+                    f"Missing/unknown state_code for row category='{category}', city_name='{city_name}'."
+                )
 
-            jurisdiction_id = _resolve_jurisdiction_id(db, category, city_name)
+            jurisdiction_id = _resolve_jurisdiction_id(
+                db, category, city_name, state_code
+            )
 
-            content = f"{law_name} {url}".strip()
-            content_hash = _sha256(content or url)
+            # Your requirement: since we don't have a separate content column, store
+            # only the law name in `content` and hash based on `content` only.
+            content = law_name.strip()
+            content_hash = hashlib.sha256(content.encode()).hexdigest()
+
+            # Idempotency: skip if *any* regulation already has this content_hash.
+            existing_hash_res = (
+                db.table("regulations")
+                .select("id")
+                .eq("content_hash", content_hash)
+                .limit(1)
+                .execute()
+            )
+            if existing_hash_res.data:
+                skipped += 1
+                continue
 
             payload: dict[str, Any] = {
                 "jurisdiction_id": jurisdiction_id,
@@ -211,17 +272,6 @@ def load_regulations_from_csv(csv_path: Path) -> dict[str, Any]:
                 "is_current": True,
                 "effective_date": None,
             }
-
-            if existing_current:
-                existing_hash = str(existing_current.get("content_hash") or "")
-                if existing_hash == content_hash:
-                    skipped += 1
-                    continue
-
-                db.table("regulations").update({"is_current": False}).eq(
-                    "id", int(existing_current["id"])
-                ).execute()
-                payload["version"] = int(existing_current.get("version") or 1) + 1
 
             db.table("regulations").insert([payload]).execute()
             loaded += 1
@@ -237,17 +287,31 @@ def load_regulations_from_csv(csv_path: Path) -> dict[str, Any]:
 def get_unindexed_regulations() -> list[dict[str, Any]]:
     db = get_db()
 
-    embeddings = db.table("regulation_embeddings").select("regulation_id").execute()
-    embedded_ids = {int(row["regulation_id"]) for row in (embeddings.data or [])}
-
     regs_res = (
         db.table("regulations")
         .select("id,content,source_name,url,domain,category,jurisdiction_id")
         .eq("is_current", True)
         .execute()
     )
+    reg_rows: list[dict[str, Any]] = regs_res.data or []
+    if not reg_rows:
+        return []
+
+    reg_ids: list[int] = [int(r["id"]) for r in reg_rows if r.get("id") is not None]
+
+    # Performance: only fetch embeddings for regulation IDs we're currently considering.
+    embeddings_res = (
+        db.table("regulation_embeddings")
+        .select("regulation_id")
+        .in_("regulation_id", reg_ids)
+        .execute()
+    )
+    embedded_ids: set[int] = {
+        int(row["regulation_id"]) for row in (embeddings_res.data or [])
+    }
+
     docs: list[dict[str, Any]] = []
-    for row in regs_res.data or []:
+    for row in reg_rows:
         rid = int(row["id"])
         if rid in embedded_ids:
             continue
@@ -298,10 +362,23 @@ def get_indexing_status() -> list[dict[str, Any]]:
         jid = int(r["jurisdiction_id"])
         regs_by_state.setdefault(jid, []).append(int(r["id"]))
 
-    embeddings_res = (
-        db.table("regulation_embeddings").select("regulation_id").execute()
-    )
-    indexed_ids = {int(r["regulation_id"]) for r in (embeddings_res.data or [])}
+    # Avoid scanning the whole embeddings table.
+    all_reg_ids: list[int] = []
+    for ids in regs_by_state.values():
+        all_reg_ids.extend([int(i) for i in ids])
+
+    if all_reg_ids:
+        embeddings_res = (
+            db.table("regulation_embeddings")
+            .select("regulation_id")
+            .in_("regulation_id", all_reg_ids)
+            .execute()
+        )
+        indexed_ids: set[int] = {
+            int(r["regulation_id"]) for r in (embeddings_res.data or [])
+        }
+    else:
+        indexed_ids = set()
 
     status: list[dict[str, Any]] = []
     for row in state_rows:

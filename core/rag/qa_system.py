@@ -137,6 +137,54 @@ _RETRIEVAL_ESA_HINT = (
 _CONTEXT_LEAK_RE = re.compile(r"^From\s+.*\(.*\).*$", re.MULTILINE)
 _NOTE_SUFFIX_RE = re.compile(r"\[Note:.*$", re.DOTALL)
 
+_SCOPE_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "lease",
+        "rent",
+        "renter",
+        "tenant",
+        "landlord",
+        "housing",
+        "evict",
+        "eviction",
+        "security deposit",
+        "deposit",
+        "repairs",
+        "habitability",
+        "fair housing",
+        "hud",
+        "esa",
+        "emotional support",
+        "assistance animal",
+        "service animal",
+        "pet",
+        "rent control",
+        "rent stabilization",
+        "insurance",
+        "homeowners",
+    }
+)
+
+
+def _is_in_scope_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    return any(k in q for k in _SCOPE_KEYWORDS)
+
+
+def _out_of_scope_answer() -> str:
+    return (
+        "I'm sorry, but your question doesn't seem to be related to housing regulations, "
+        "leasing, compliance, or tenant/landlord law. I'm specialized in helping with:\n\n"
+        "- Housing and leasing regulations\n"
+        "- Tenant rights and landlord obligations (repairs, deposits, habitability)\n"
+        "- ESA / service animal rules and accommodations\n"
+        "- Rent control and renters protections\n"
+        "- City/state-specific regulations and compliance checks\n\n"
+        "Please ask a question related to these topics and I can assist you."
+    )
+
 
 def _states_mentioned(question: str) -> list[str]:
     """Return canonical state tokens found in the question (names or abbreviations)."""
@@ -392,6 +440,9 @@ class QASystem:
         chat_history: list[dict[str, Any]],
         jurisdiction_id: int | None = None,
     ) -> dict[str, Any]:
+        if not _is_in_scope_question(question):
+            return {"answer": _out_of_scope_answer(), "sources": []}
+
         # In `rule_based` mode we should still return a helpful message even if
         # vector search is unavailable (e.g., missing/invalid Supabase config).
         cross = _needs_cross_jurisdiction_retrieval(question)

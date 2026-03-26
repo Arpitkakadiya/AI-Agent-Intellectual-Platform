@@ -15,7 +15,9 @@ from db.client import get_db
 
 
 def _sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(text.encode()).hexdigest()
+
+FEDERAL_LEGACY_NAMES: list[str] = ["Federal Government", "United States"]
 
 
 STATE_NAME_TO_CODE: dict[str, str] = {
@@ -71,6 +73,8 @@ STATE_NAME_TO_CODE: dict[str, str] = {
     "Wyoming": "WY",
 }
 
+CODE_TO_STATE_NAME: dict[str, str] = {code: name for name, code in STATE_NAME_TO_CODE.items()}
+
 CITY_TO_STATE_CODE: dict[str, str] = {
     "Los Angeles": "CA",
     "San Francisco": "CA",
@@ -90,7 +94,7 @@ def _get_federal_jurisdiction_id() -> int:
         db.table("jurisdictions")
         .select("id")
         .eq("type", "federal")
-        .eq("name", "Federal Government")
+        .in_("name", FEDERAL_LEGACY_NAMES)
         .limit(1)
         .execute()
     )
@@ -118,44 +122,86 @@ def _get_state_jurisdiction_id(state_code: str) -> int:
     return int(res.data[0]["id"])
 
 
-def _resolve_jurisdiction_id(category: str, city_name: str) -> int:
+def _infer_state_code(city_name: str) -> str | None:
+    label = (city_name or "").strip()
+    if not label:
+        return None
+
+    if label.lower().endswith("-statewide"):
+        # Example: "California-Statewide" -> "California"
+        state_part = label.split("-", 1)[0].strip()
+        state_part = state_part.replace("NewYork", "New York")
+        return STATE_NAME_TO_CODE.get(state_part)
+
+    if label in STATE_NAME_TO_CODE:
+        return STATE_NAME_TO_CODE[label]
+
+    # City name fallback (used by older datasets without state_code).
+    return CITY_TO_STATE_CODE.get(label)
+
+
+def _resolve_jurisdiction_id(category: str, city_name: str, state_code: str) -> int:
+    """
+    Resolve `jurisdictions.id` for a CSV row.
+
+    Uses the CSV `state_code` column for correct lookups across states.
+    """
+
     kind = (category or "").strip().lower()
     label = (city_name or "").strip()
+    code = (state_code or "").strip().upper()
 
     if kind == "federal":
         return _get_federal_jurisdiction_id()
 
     if kind == "state":
-        # Expect "California-Statewide" style. Some rows may omit the dash.
-        state_part = label.split("-", 1)[0].strip()
-        state_part = state_part.replace("NewYork", "New York")
-        state_code = STATE_NAME_TO_CODE.get(state_part)
-        if not state_code:
-            raise RuntimeError(f"Cannot map state name '{state_part}' to a state code.")
-        return _get_state_jurisdiction_id(state_code)
+        if not code:
+            raise RuntimeError("Missing state_code for state jurisdiction row.")
+        return _get_state_jurisdiction_id(code)
 
     if kind == "city":
+        if not code:
+            raise RuntimeError("Missing state_code for city jurisdiction row.")
         # Prefer an actual city jurisdiction if present; otherwise fall back to state.
         db = get_db()
         city_res = (
             db.table("jurisdictions")
             .select("id")
             .eq("type", "city")
+            .eq("state_code", code)
             .eq("name", label)
             .limit(1)
             .execute()
         )
         if city_res.data:
             return int(city_res.data[0]["id"])
+        # Fallback: if city jurisdictions aren't seeded for every state, keep imports working
+        # by using the state jurisdiction as the best available scope.
+        return _get_state_jurisdiction_id(code)
 
-        state_code = CITY_TO_STATE_CODE.get(label)
-        if not state_code:
-            raise RuntimeError(
-                f"City '{label}' not found in jurisdictions and no fallback mapping exists."
-            )
-        return _get_state_jurisdiction_id(state_code)
+    # Regulation-category rows (e.g. "Renters", "Pet Policy", "ESA") use `city_name` + `state_code`
+    # to decide whether the target jurisdiction is a city or a state.
+    if not code:
+        raise RuntimeError(f"Missing state_code for category='{category}' row with city_name='{label}'.")
 
-    raise RuntimeError(f"Unknown category '{category}'. Expected Federal/State/City.")
+    expected_state_name = CODE_TO_STATE_NAME.get(code)
+    if expected_state_name and label.lower() == expected_state_name.lower():
+        return _get_state_jurisdiction_id(code)
+
+    db = get_db()
+    city_res = (
+        db.table("jurisdictions")
+        .select("id")
+        .eq("type", "city")
+        .eq("name", label)
+        .eq("state_code", code)
+        .limit(1)
+        .execute()
+    )
+    if not city_res.data:
+        # Fallback: if city jurisdictions aren't seeded for this state, fall back to the state scope.
+        return _get_state_jurisdiction_id(code)
+    return int(city_res.data[0]["id"])
 
 
 def main() -> None:
@@ -179,29 +225,32 @@ def main() -> None:
             category = (row.get("category") or "").strip()
             city_name = (row.get("city_name") or "").strip()
             law_name = (row.get("law_name") or "").strip()
-            # Keep non-empty seed text so vector search has at least some content.
-            content = f"{law_name} {url}".strip()
-            content_hash = _sha256(content or url)
+            state_code = (row.get("state_code") or "").strip().upper()
+            if not state_code:
+                state_code = _infer_state_code(city_name or "")
+            if not state_code:
+                raise RuntimeError(
+                    f"Missing/unknown state_code for row category='{category}', city_name='{city_name}'."
+                )
+            # Your requirements: `content` is just law_name, and hash is derived from `content` only.
+            content = (law_name or "").strip()
+            content_hash = _sha256(content)
 
-            # Idempotency: skip if there is already an `is_current` row with the same content_hash.
-            existing_current_res = (
+            # Idempotency: skip if ANY existing row already has this content_hash.
+            existing_hash_res = (
                 db.table("regulations")
-                .select("id,content_hash,version")
-                .eq("url", url)
-                .eq("is_current", True)
+                .select("id")
+                .eq("content_hash", content_hash)
                 .limit(1)
                 .execute()
             )
-            existing_current = (
-                existing_current_res.data[0] if existing_current_res.data else None
-            )
-            if existing_current:
-                existing_hash = str(existing_current.get("content_hash") or "")
-                if existing_hash == content_hash:
-                    skipped += 1
-                    continue
+            if existing_hash_res.data:
+                skipped += 1
+                continue
 
-            jurisdiction_id = _resolve_jurisdiction_id(category=category, city_name=city_name)
+            jurisdiction_id = _resolve_jurisdiction_id(
+                category=category, city_name=city_name, state_code=state_code
+            )
 
             payload: dict[str, Any] = {
                 "jurisdiction_id": jurisdiction_id,
@@ -215,12 +264,6 @@ def main() -> None:
                 "is_current": True,
                 "effective_date": None,
             }
-
-            if existing_current:
-                payload["version"] = int(existing_current.get("version") or 1) + 1
-                db.table("regulations").update({"is_current": False}).eq(
-                    "id", int(existing_current["id"])
-                ).execute()
 
             db.table("regulations").insert([payload]).execute()
             loaded += 1

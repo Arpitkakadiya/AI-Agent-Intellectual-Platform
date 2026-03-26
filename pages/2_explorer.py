@@ -46,7 +46,9 @@ def show_page() -> None:
             query=query.strip(),
             jurisdiction_id=selected_state_id,
             category=category_value,
-            n_results=10,
+            # Keep result count small to reduce pgvector query cost and avoid
+            # statement timeouts in Supabase's default statement_timeout window.
+            n_results=5,
         )
 
         st.subheader("Results")

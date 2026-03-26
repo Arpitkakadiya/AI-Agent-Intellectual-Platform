@@ -93,9 +93,14 @@ def search_regulations(
 
     store = RegulationVectorStore()
     raw_results = store.search(
-        query=query, n_results=n_results, jurisdiction_id=jurisdiction_id
+        query=query,
+        n_results=n_results,
+        jurisdiction_id=jurisdiction_id,
+        category_filter=category,
     )
 
+    # `category_filter` is already applied inside the RPC for efficiency,
+    # but we keep the safety filter here as well.
     filtered: list[dict[str, Any]] = []
     for r in raw_results:
         meta = r.metadata or {}

@@ -33,6 +33,11 @@ def _chunk_text(
     if not t:
         return []
 
+    # If the whole text fits into one chunk, don't split it further (even if overlap is large).
+    if len(t) <= chunk_size:
+        cleaned = t.strip()
+        return [cleaned] if cleaned else []
+
     chunks: list[str] = []
     step = chunk_size - overlap
     for start in range(0, len(t), step):
@@ -56,11 +61,17 @@ class RegulationVectorStore:
         db = get_db()
 
         # Replace semantics: delete old embeddings for any affected regulation_ids.
-        regulation_ids = sorted(
+        regulation_ids: list[int] = sorted(
             {int(d["regulation_id"]) for d in docs if "regulation_id" in d}
         )
-        for rid in regulation_ids:
-            db.table("regulation_embeddings").delete().eq("regulation_id", rid).execute()
+        if regulation_ids:
+            # Batched delete to keep SQL statements small and avoid statement timeouts.
+            delete_batch_size: int = 500
+            for i in range(0, len(regulation_ids), delete_batch_size):
+                batch_ids = regulation_ids[i : i + delete_batch_size]
+                db.table("regulation_embeddings").delete().in_(
+                    "regulation_id", batch_ids
+                ).execute()
 
         rows: list[dict[str, Any]] = []
         for doc in docs:
@@ -90,6 +101,7 @@ class RegulationVectorStore:
         n_results: int = 10,
         jurisdiction_id: int | None = None,
         query_embedding: list[float] | None = None,
+        category_filter: str | None = None,
     ) -> list[SearchResult]:
         db = get_db()
 
@@ -98,8 +110,10 @@ class RegulationVectorStore:
             "query_embedding": qemb,
             "match_count": int(n_results),
             "filter_jurisdiction": jurisdiction_id,
+            "category_filter": category_filter,
         }
-        res = db.rpc("match_regulations", payload).execute()
+        # Use the v2 RPC to reduce scan cost and avoid statement timeouts.
+        res = db.rpc("match_regulations_v2", payload).execute()
 
         out: list[SearchResult] = []
         for row in res.data or []:
