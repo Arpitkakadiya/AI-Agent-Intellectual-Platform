@@ -33,7 +33,7 @@
 |---------------|---------------|--------------------------|
 | id            | SERIAL        | Primary key              |
 | regulation_id | INT           | FK → regulations.id      |
-| embedding     | vector(1536)  | pgvector                 |
+| embedding     | vector(3072)  | pgvector (Gemini dims)   |
 | chunk_text    | TEXT          | 800-char chunk           |
 
 ### email_subscriptions
@@ -76,10 +76,34 @@
 | notes                    | TEXT    | Nullable                  |
 | source_regulation_id     | INT     | FK → regulations.id       |
 
+### app_settings
+| Column     | Type        | Notes                                  |
+|------------|-------------|----------------------------------------|
+| key        | TEXT        | Primary key (e.g. "use_db_source_registry") |
+| value      | TEXT        | Feature flag value ("true"/"false")    |
+| updated_at | TIMESTAMPTZ | auto                                   |
+
+### regulation_sources
+| Column          | Type        | Notes                                  |
+|-----------------|-------------|----------------------------------------|
+| id              | SERIAL      | Primary key                            |
+| jurisdiction_id | INT         | FK → jurisdictions.id                  |
+| source_name     | TEXT        | Human-readable name                    |
+| url             | TEXT        | Unique — the scrape target             |
+| domain          | TEXT        | Default "housing"                      |
+| category        | TEXT        | Default "General"                      |
+| state_code      | CHAR(2)     | Nullable                               |
+| is_active       | BOOL        | Per-source toggle (default true)       |
+| last_scraped_at | TIMESTAMPTZ | Updated after each scrape attempt      |
+| last_error      | TEXT        | Nullable — last scrape error message   |
+| created_at      | TIMESTAMPTZ | auto                                   |
+
 ## Pydantic Models (db/models.py)
 - Jurisdiction, Regulation, RegulationEmbedding
 - EmailSubscription, RegulationUpdate
 - PetPolicy, InsuranceRequirement
+- **RegulationSource** — maps to `regulation_sources`
+- **AppSetting** — maps to `app_settings`
 - ComplianceResult, ComplianceIssue (core/compliance/checker.py)
 - UpdateResult (core/regulations/update_checker.py)
 - SearchResult (core/rag/vector_store.py)

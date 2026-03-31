@@ -466,17 +466,76 @@ class RegulationScraper:
             is_current=True,
         )
 
-    def scrape_all_sources(self) -> list[Regulation]:
-        db = get_db()
-        regs_res = (
-            db.table("regulations")
-            .select("url,source_name,jurisdiction_id,domain,category")
-            .eq("is_current", True)
-            .execute()
-        )
-        rows = regs_res.data or []
-        results: list[Regulation] = []
+    # -- provider-aware source loading --
 
+    def _use_db_registry(self) -> bool:
+        """Check if the DB source registry toggle is on (graceful fallback to False)."""
+        try:
+            from core.regulations.source_registry import source_registry
+            return source_registry.is_db_registry_enabled()
+        except Exception:
+            return False
+
+    def _get_source_rows_from_db_registry(
+        self, jurisdiction_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load active sources from regulation_sources table."""
+        try:
+            from core.regulations.source_registry import source_repo
+        except Exception:
+            return []
+
+        rows = source_repo.list_all(active_only=True)
+        if jurisdiction_id is not None:
+            rows = [r for r in rows if int(r.get("jurisdiction_id") or 0) == jurisdiction_id]
+        return rows
+
+    def _get_source_rows_from_regulations(
+        self, jurisdiction_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Legacy path: load sources from the regulations table (is_current rows)."""
+        db = get_db()
+        query = (
+            db.table("regulations")
+            .select("id,url,source_name,jurisdiction_id,domain,category,content_hash,version")
+            .eq("is_current", True)
+        )
+        if jurisdiction_id is not None:
+            query = query.eq("jurisdiction_id", int(jurisdiction_id))
+        return query.execute().data or []
+
+    def _update_source_scrape_status(
+        self, url: str, *, error: str | None = None,
+    ) -> None:
+        """Best-effort: update regulation_sources.last_scraped_at / last_error."""
+        try:
+            from core.regulations.source_registry import source_repo
+            from datetime import datetime, timezone
+
+            row = source_repo.get_by_url(url)
+            if row:
+                source_repo.update_scrape_status(
+                    int(row["id"]),
+                    last_scraped_at=datetime.now(timezone.utc),
+                    last_error=error,
+                )
+        except Exception:
+            pass
+
+    def scrape_all_sources(self) -> list[Regulation]:
+        if self._use_db_registry():
+            rows = self._get_source_rows_from_db_registry()
+        else:
+            db = get_db()
+            res = (
+                db.table("regulations")
+                .select("url,source_name,jurisdiction_id,domain,category")
+                .eq("is_current", True)
+                .execute()
+            )
+            rows = res.data or []
+
+        results: list[Regulation] = []
         for row in rows:
             url = str(row.get("url") or "").strip()
             if not url:
@@ -490,31 +549,25 @@ class RegulationScraper:
             )
             if reg is not None:
                 results.append(reg)
-
         return results
 
     def scrape_and_index(
         self, jurisdiction_id: int | None = None
     ) -> dict[str, Any]:
         db = get_db()
+        use_registry = self._use_db_registry()
 
-        query = (
-            db.table("regulations")
-            .select("id,url,source_name,jurisdiction_id,domain,category,content_hash,version")
-            .eq("is_current", True)
-        )
-        if jurisdiction_id is not None:
-            query = query.eq("jurisdiction_id", int(jurisdiction_id))
-
-        regs_res = query.execute()
-        rows = regs_res.data or []
+        if use_registry:
+            source_rows = self._get_source_rows_from_db_registry(jurisdiction_id)
+        else:
+            source_rows = self._get_source_rows_from_regulations(jurisdiction_id)
 
         scraped = 0
         indexed = 0
         errors: list[str] = []
         new_docs: list[dict[str, Any]] = []
 
-        for row in rows:
+        for row in source_rows:
             url = str(row.get("url") or "").strip()
             if not url:
                 continue
@@ -528,20 +581,34 @@ class RegulationScraper:
             )
             if reg is None:
                 errors.append(f"Failed to scrape {url}")
+                self._update_source_scrape_status(url, error=f"Scrape failed")
                 continue
 
             scraped += 1
+            self._update_source_scrape_status(url, error=None)
 
-            old_hash = str(row.get("content_hash") or "")
+            # Find the current regulation row for this URL to detect content changes.
+            existing = (
+                db.table("regulations")
+                .select("id,content_hash,version")
+                .eq("url", url)
+                .eq("is_current", True)
+                .limit(1)
+                .execute()
+            )
+            existing_row = (existing.data or [None])[0]
+
+            old_hash = str(existing_row.get("content_hash") or "") if existing_row else ""
             if reg.content_hash == old_hash:
                 continue
 
-            old_id = int(row["id"])
-            old_version = int(row.get("version") or 1)
+            old_id = int(existing_row["id"]) if existing_row else None
+            old_version = int(existing_row.get("version") or 0) if existing_row else 0
 
-            db.table("regulations").update({"is_current": False}).eq(
-                "id", old_id
-            ).execute()
+            if old_id is not None:
+                db.table("regulations").update({"is_current": False}).eq(
+                    "id", old_id
+                ).execute()
 
             new_payload: dict[str, Any] = {
                 "jurisdiction_id": reg.jurisdiction_id,

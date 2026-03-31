@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     RAG_LLM_RERANK_ENABLED: bool = False
     RAG_USE_LEGAL_CHUNKING: bool = True
 
+    # Source registry: when True the scraper reads from regulation_sources table
+    # instead of the CSV file.  Persisted in app_settings; this env var is the
+    # initial default only (DB value wins once set).
+    USE_DB_SOURCE_REGISTRY: bool = False
+
     LEGAL_DISCLAIMER: str = (
         "⚠️ This tool is for informational purposes only. It is not legal advice. "
         "Consult qualified legal counsel before making decisions."

@@ -22,8 +22,14 @@ py -3.9 -m pip install -r requirements.txt
 In the Supabase Dashboard:
 
 1. Go to **SQL Editor**
-2. Run the schema/migration file:
+2. Run the migration files **in order**:
    - `db/migrations/001_initial_schema.sql`
+   - `db/migrations/002_gemini_embedding_3072.sql`
+   - `db/migrations/003_match_regulations_include_federal.sql`
+   - `db/migrations/004_match_regulations_optimized.sql`
+   - `db/migrations/005_match_regulations_v2.sql`
+   - `db/migrations/006_hybrid_retrieval.sql`
+   - `db/migrations/007_regulation_sources.sql` — adds `regulation_sources` + `app_settings` tables
 3. Ensure the `vector` extension is enabled (it is created by the migration script).
 
 ## 4) Create your environment file
@@ -95,6 +101,10 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.regulation_embeddings TO an
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.regulation_updates TO anon, authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.email_subscriptions TO anon, authenticated;
 
+-- Source registry + app settings (migration 007)
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.regulation_sources TO anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.app_settings TO anon, authenticated;
+
 -- Policy helpers (if RLS is enabled). These are permissive for dev.
 DROP POLICY IF EXISTS "anon_rw_jurisdictions" ON public.jurisdictions;
 CREATE POLICY "anon_rw_jurisdictions"
@@ -131,6 +141,22 @@ WITH CHECK (true);
 DROP POLICY IF EXISTS "anon_rw_email_subscriptions" ON public.email_subscriptions;
 CREATE POLICY "anon_rw_email_subscriptions"
 ON public.email_subscriptions
+FOR ALL
+TO anon
+USING (true)
+WITH CHECK (true);
+
+DROP POLICY IF EXISTS "anon_rw_regulation_sources" ON public.regulation_sources;
+CREATE POLICY "anon_rw_regulation_sources"
+ON public.regulation_sources
+FOR ALL
+TO anon
+USING (true)
+WITH CHECK (true);
+
+DROP POLICY IF EXISTS "anon_rw_app_settings" ON public.app_settings;
+CREATE POLICY "anon_rw_app_settings"
+ON public.app_settings
 FOR ALL
 TO anon
 USING (true)
@@ -200,8 +226,14 @@ If SMTP is configured:
 - **Load regulations from CSV**: runs `seed_db.py` logic
 - **Initialize vector index**: runs vector embedding for unindexed rows
 - **Indexing status**: shows per-state indexing counts
+- **Source Registry** (requires migration 007):
+  - **Global toggle**: switch between CSV and DB as the source provider
+  - **Import CSV → DB**: one-click idempotent backfill of `sources.csv` into `regulation_sources`
+  - **Source list**: view all registered sources with per-source Activate/Deactivate, Test, and Delete actions
+  - **Add source form**: register new URLs directly from the UI
+  - **Test Source**: probe a URL for reachability without scraping
 - **Scraper**:
-  - Manual trigger starts scraping + re-indexing
+  - Manual trigger starts scraping + re-indexing (reads from CSV or DB depending on toggle)
 
 ## 9) Troubleshooting
 

@@ -74,5 +74,29 @@ class InsuranceRequirement(BaseModel):
     source_regulation_id: int
 
 
+class RegulationSource(BaseModel):
+    """A scrape-target URL with metadata.  Separates 'what to scrape' from 'what was scraped'."""
+
+    id: Optional[int] = None
+    jurisdiction_id: int
+    source_name: str
+    url: str
+    domain: str = "housing"
+    category: str = "General"
+    state_code: Optional[str] = None
+    is_active: bool = True
+    last_scraped_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class AppSetting(BaseModel):
+    """Persistent key-value pair for feature flags and app configuration."""
+
+    key: str
+    value: str
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 # Convenience aliases for JSONB-ish columns if needed elsewhere
 JsonDict = dict[str, Any]
