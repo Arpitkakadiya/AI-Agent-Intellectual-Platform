@@ -1,18 +1,22 @@
 import streamlit as st
 
-import config
+st.set_page_config(
+    page_title="RegComply",
+    page_icon="⚖️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
+pg = st.navigation(
+    [
+        st.Page("pages/1_agent.py", title="Compliance Agent", icon="💬", default=True),
+        st.Page("pages/2_explorer.py", title="Explorer", icon="🔍"),
+        st.Page("pages/3_update_log.py", title="Update Log", icon="📄"),
+        st.Page("pages/4_email_alerts.py", title="Email Alerts", icon="📧"),
+        st.Page("pages/5_settings.py", title="Settings", icon="⚙️"),
+        st.Page("pages/6_source_registry.py", title="Source Registry", icon="🗂️"),
+    ],
+    position="hidden",
+)
 
-def main() -> None:
-    st.set_page_config(page_title="Compliance Agent", page_icon="⚖️", layout="wide")
-
-    with st.sidebar:
-        st.title("Compliance Agent")
-        st.caption(config.LEGAL_DISCLAIMER)
-
-    st.title("Compliance Agent")
-    st.write("Use the pages in the left sidebar to get started.")
-
-
-if __name__ == "__main__":
-    main()
+pg.run()

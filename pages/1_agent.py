@@ -10,6 +10,7 @@ from core.rag.qa_system import qa
 from core.rag.utils import deduplicate_sources
 from db.client import get_db
 from db.models import Jurisdiction
+from ui_theme import apply_theme, page_header
 
 COMPLIANCE_KEYWORDS = ("compliant", "compliance", "check")
 FILE_BYTES_KEY = "uploaded_file_bytes"
@@ -65,9 +66,11 @@ def _load_cities(state_id: int) -> list[Jurisdiction]:
     return [Jurisdiction.model_validate(row) for row in (res.data or [])]
 
 
-def _show_sidebar() -> None:
+def _show_agent_sidebar_extras() -> None:
+    """Extra sidebar widgets specific to the agent page (jurisdiction + document upload)."""
     with st.sidebar:
-        st.header("Jurisdiction")
+        st.divider()
+        st.caption("JURISDICTION")
 
         try:
             states = _load_states()
@@ -123,25 +126,13 @@ def _show_sidebar() -> None:
             st.session_state[JURISDICTION_KEY] = selected_city_id or selected_state_id
 
         st.divider()
-        if st.button("Clear chat", use_container_width=True):
-            _clear_chat()
-            st.rerun()
+        st.caption("DOCUMENT REVIEW")
 
-        st.divider()
-        st.caption(config.LEGAL_DISCLAIMER)
-
-
-def _show_file_uploader() -> Optional[dict[str, Any]]:
-    active_file: Optional[dict[str, Any]] = None
-    with st.expander("Document compliance checker — click to expand"):
-        st.write(
-            "Upload a lease document (PDF or DOCX) and ask a compliance question "
-            "to run clause-by-clause analysis."
-        )
         uploaded = st.file_uploader(
-            "Upload lease document",
+            "Upload lease or document",
             type=["pdf", "docx", "doc"],
             accept_multiple_files=False,
+            help="PDF or DOCX for compliance analysis",
         )
 
         if uploaded is not None:
@@ -151,16 +142,22 @@ def _show_file_uploader() -> Optional[dict[str, Any]]:
             st.session_state[FILE_SIZE_KEY] = uploaded.size
 
         if FILE_BYTES_KEY in st.session_state and FILE_NAME_KEY in st.session_state:
-            active_file = {
-                "bytes": st.session_state[FILE_BYTES_KEY],
-                "name": st.session_state[FILE_NAME_KEY],
-                "size": st.session_state.get(FILE_SIZE_KEY, 0),
-            }
-            st.success(
-                f"File ready: `{active_file['name']}` "
-                f"({int(active_file['size']) / 1024:.1f} KB)"
-            )
-    return active_file
+            fname = st.session_state[FILE_NAME_KEY]
+            fsize = st.session_state.get(FILE_SIZE_KEY, 0)
+            st.success(f"📄 **{fname}** ({int(fsize) / 1024:.1f} KB)")
+
+        st.divider()
+        st.caption(config.LEGAL_DISCLAIMER)
+
+
+def _get_active_file() -> Optional[dict[str, Any]]:
+    if FILE_BYTES_KEY in st.session_state and FILE_NAME_KEY in st.session_state:
+        return {
+            "bytes": st.session_state[FILE_BYTES_KEY],
+            "name": st.session_state[FILE_NAME_KEY],
+            "size": st.session_state.get(FILE_SIZE_KEY, 0),
+        }
+    return None
 
 
 def _format_compliance_markdown(result: Any) -> str:
@@ -250,47 +247,50 @@ def _handle_message(prompt: str, active_file: Optional[dict[str, Any]]) -> None:
     answer = ""
     sources: list[dict[str, Any]] = []
 
-    if should_run_compliance:
-        if not file_present:
-            answer = (
-                "I can run a compliance check, but I need a lease document first. "
-                "Please upload a PDF or DOCX in the compliance checker section."
-            )
-        else:
-            try:
-                result = checker.check_compliance(
-                    file_bytes=active_file["bytes"],
-                    filename=active_file["name"],
-                    jurisdiction_id=int(jurisdiction_id),
+    with st.chat_message("assistant"):
+        if should_run_compliance:
+            if not file_present:
+                answer = (
+                    "I can run a compliance check, but I need a lease document first. "
+                    "Please upload a PDF or DOCX in the **Document Review** section of the sidebar."
                 )
-                answer = _format_compliance_markdown(result)
-                sources = list(result.sources)
-            except Exception as exc:  # noqa: BLE001
-                answer = f"Compliance check failed: {exc}"
-    else:
-        try:
-            qa_result = qa.answer_question(
-                question=prompt,
-                chat_history=st.session_state[CHAT_KEY],
-                jurisdiction_id=int(jurisdiction_id),
-            )
-            answer = str(qa_result.get("answer") or "")
-            sources = list(qa_result.get("sources") or [])
-        except Exception as exc:  # noqa: BLE001
-            answer = f"Unable to answer right now: {exc}"
+            else:
+                with st.spinner("Reviewing document for compliance..."):
+                    try:
+                        result = checker.check_compliance(
+                            file_bytes=active_file["bytes"],
+                            filename=active_file["name"],
+                            jurisdiction_id=int(jurisdiction_id),
+                        )
+                        answer = _format_compliance_markdown(result)
+                        sources = list(result.sources)
+                    except Exception as exc:  # noqa: BLE001
+                        answer = f"Compliance check failed: {exc}"
+        else:
+            with st.spinner("Thinking..."):
+                try:
+                    qa_result = qa.answer_question(
+                        question=prompt,
+                        chat_history=st.session_state[CHAT_KEY],
+                        jurisdiction_id=int(jurisdiction_id),
+                    )
+                    answer = str(qa_result.get("answer") or "")
+                    sources = list(qa_result.get("sources") or [])
+                except Exception as exc:  # noqa: BLE001
+                    answer = f"Unable to answer right now: {exc}"
+
+        st.markdown(answer)
+        deduped_sources = deduplicate_sources(sources)
+        _render_sources(deduped_sources)
+        if any(k in answer.lower() for k in ("new law", "update", "regulation")):
+            st.info("Want alerts for new regulations? Subscribe on the Email Alerts page.")
 
     assistant_message = {
         "role": "assistant",
         "content": answer,
-        "sources": deduplicate_sources(sources),
+        "sources": deduped_sources,
     }
     st.session_state[CHAT_KEY].append(assistant_message)
-
-    with st.chat_message("assistant"):
-        st.markdown(answer)
-        _render_sources(assistant_message["sources"])
-        if any(k in answer.lower() for k in ("new law", "update", "regulation")):
-            st.info("Want alerts for new regulations? Subscribe on the Email Alerts page.")
 
 
 def _render_history() -> None:
@@ -306,30 +306,34 @@ def _render_history() -> None:
 
 
 def _render_empty_state() -> None:
-    with st.chat_message("assistant"):
-        st.markdown(
-            "Hi! I can answer housing regulation questions and review lease documents for compliance."
-        )
+    st.write("")
+    st.markdown("#### 💬 Compliance Assistant")
+    st.write(
+        "Ask questions about housing regulations, review lease compliance, "
+        "or explore regulatory requirements."
+    )
+    st.write("")
 
-    col1, col2 = st.columns(2)
     examples = [
-        "What are ESA rules?",
-        "Pet deposit laws in Texas",
-        "Attach document to check compliance",
-        "New rent control laws",
+        ("🌐 Regulation Q&A", "What are the latest rent control regulations in California?"),
+        ("🔒 Lease Compliance", "What notice period is required for lease termination in NYC?"),
+        ("📄 Document Review", "Does my lease comply with fair housing requirements?"),
     ]
-    cols = [col1, col2, col1, col2]
-    for col, text in zip(cols, examples):
-        if col.button(text, use_container_width=True):
-            st.session_state[PENDING_PROMPT_KEY] = text
-            st.rerun()
+
+    for label, text in examples:
+        with st.container(border=True):
+            if st.button(f"**{label}** — {text}", key=f"ex_{label}", use_container_width=True):
+                st.session_state[PENDING_PROMPT_KEY] = text
+                st.rerun()
 
 
 def show_agent_page() -> None:
-    st.title("Intelligence Platform Agent")
     _init_state()
-    _show_sidebar()
-    active_file = _show_file_uploader()
+    apply_theme()
+    _show_agent_sidebar_extras()
+    page_header("Compliance Agent", "AI-powered regulatory Q&A and document analysis")
+
+    active_file = _get_active_file()
 
     if st.session_state[CHAT_KEY]:
         _render_history()
@@ -341,7 +345,12 @@ def show_agent_page() -> None:
         _handle_message(str(prompt), active_file)
         st.rerun()
 
-    placeholder = "Ask a question about housing regulations..."
+    if st.session_state[CHAT_KEY]:
+        if st.button("🗑️ Clear conversation"):
+            _clear_chat()
+            st.rerun()
+
+    placeholder = "Ask about housing regulations..."
     if active_file is not None:
         placeholder = f"Ask compliance question for {active_file['name']}..."
 
@@ -352,4 +361,3 @@ def show_agent_page() -> None:
 
 
 show_agent_page()
-

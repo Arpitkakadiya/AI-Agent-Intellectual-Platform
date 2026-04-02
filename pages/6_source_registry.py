@@ -7,6 +7,7 @@ from typing import Any
 import streamlit as st
 
 from db.client import get_db
+from ui_theme import apply_theme, page_header
 
 _REGISTRY_AVAILABLE = False
 try:
@@ -103,15 +104,16 @@ def _section_header(all_sources: list[dict[str, Any]]) -> None:
 
     with col_import:
         if st.button("Import CSV to DB", key="sr_backfill", use_container_width=True):
-            try:
-                res = source_registry.backfill_from_csv(_csv_path())
-                st.success(
-                    "Imported " + str(res["imported"])
-                    + ", skipped " + str(res["skipped"])
-                    + ", errors " + str(res["errors"])
-                )
-            except Exception as exc:
-                st.error("Backfill failed: " + str(exc))
+            with st.spinner("Importing CSV..."):
+                try:
+                    res = source_registry.backfill_from_csv(_csv_path())
+                    st.success(
+                        "Imported " + str(res["imported"])
+                        + ", skipped " + str(res["skipped"])
+                        + ", errors " + str(res["errors"])
+                    )
+                except Exception as exc:
+                    st.error("Backfill failed: " + str(exc))
 
     with col_export:
         csv_data = source_registry.export_sources_csv()
@@ -250,19 +252,20 @@ def _handle_edit_dialog(jurisdictions: list[dict[str, Any]]) -> None:
         if not ed_name or not ed_url:
             st.warning("Name and URL are required.")
             return
-        try:
-            source_registry.update_source(editing_id, {
-                "source_name": ed_name.strip(),
-                "url": ed_url.strip(),
-                "category": ed_category.strip() or "General",
-                "domain": ed_domain.strip() or "housing",
-                "jurisdiction_id": ed_jur_id,
-            })
-            st.success("Updated: **" + ed_name.strip() + "**")
-            st.session_state.pop("sr_editing", None)
-            st.rerun()
-        except Exception as exc:
-            st.error("Update failed: " + str(exc))
+        with st.spinner("Saving changes..."):
+            try:
+                source_registry.update_source(editing_id, {
+                    "source_name": ed_name.strip(),
+                    "url": ed_url.strip(),
+                    "category": ed_category.strip() or "General",
+                    "domain": ed_domain.strip() or "housing",
+                    "jurisdiction_id": ed_jur_id,
+                })
+                st.success("Updated: **" + ed_name.strip() + "**")
+                st.session_state.pop("sr_editing", None)
+                st.rerun()
+            except Exception as exc:
+                st.error("Update failed: " + str(exc))
 
     st.markdown("---")
 
@@ -323,7 +326,8 @@ def _render_source_card(src: dict[str, Any]) -> None:
 
             toggle_label = "Deactivate" if active else "Activate"
             if st.button(toggle_label, key="sr_tog_" + str(sid), use_container_width=True):
-                source_registry.toggle_source_active(sid, not active)
+                with st.spinner("Updating..."):
+                    source_registry.toggle_source_active(sid, not active)
                 st.rerun()
 
             if st.button("Test URL", key="sr_test_" + str(sid), use_container_width=True):
@@ -338,7 +342,8 @@ def _render_source_card(src: dict[str, Any]) -> None:
                     st.error("Failed: " + err_detail)
 
             if st.button("Delete", key="sr_del_" + str(sid), use_container_width=True):
-                source_registry.delete_source(sid)
+                with st.spinner("Deleting..."):
+                    source_registry.delete_source(sid)
                 st.rerun()
 
         # Scrape history (collapsed sub-section)
@@ -363,15 +368,17 @@ def _tab_sources(all_sources: list[dict[str, Any]]) -> None:
     ba1, ba2, ba3 = st.columns([1, 1, 4])
     with ba1:
         if st.button("Activate all shown", key="sr_bulk_act", use_container_width=True):
-            for s in filtered:
-                if not s.get("is_active"):
-                    source_registry.toggle_source_active(s["id"], True)
+            with st.spinner("Activating sources..."):
+                for s in filtered:
+                    if not s.get("is_active"):
+                        source_registry.toggle_source_active(s["id"], True)
             st.rerun()
     with ba2:
         if st.button("Deactivate all shown", key="sr_bulk_deact", use_container_width=True):
-            for s in filtered:
-                if s.get("is_active"):
-                    source_registry.toggle_source_active(s["id"], False)
+            with st.spinner("Deactivating sources..."):
+                for s in filtered:
+                    if s.get("is_active"):
+                        source_registry.toggle_source_active(s["id"], False)
             st.rerun()
 
     if not filtered:
@@ -446,18 +453,19 @@ def _tab_add_source() -> None:
         if not new_name or not new_url:
             st.warning("Source name and URL are required.")
             return
-        try:
-            source_registry.add_source({
-                "source_name": new_name.strip(),
-                "url": new_url.strip(),
-                "category": new_category.strip() or "General",
-                "domain": new_domain.strip() or "housing",
-                "jurisdiction_id": jurisdiction_id,
-                "is_active": True,
-            })
-            st.success("Added: **" + new_name.strip() + "**")
-        except Exception as exc:
-            st.error("Failed to add source: " + str(exc))
+        with st.spinner("Adding source..."):
+            try:
+                source_registry.add_source({
+                    "source_name": new_name.strip(),
+                    "url": new_url.strip(),
+                    "category": new_category.strip() or "General",
+                    "domain": new_domain.strip() or "housing",
+                    "jurisdiction_id": jurisdiction_id,
+                    "is_active": True,
+                })
+                st.success("Added: **" + new_name.strip() + "**")
+            except Exception as exc:
+                st.error("Failed to add source: " + str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -465,8 +473,8 @@ def _tab_add_source() -> None:
 # ---------------------------------------------------------------------------
 
 def show_page() -> None:
-    st.title("📋 Source Registry")
-    st.caption("Manage regulation source URLs that the scraper monitors.")
+    apply_theme()
+    page_header("Source Registry", "Manage regulation source URLs that the scraper monitors")
 
     if not _REGISTRY_AVAILABLE or source_registry is None:
         _show_unavailable()
