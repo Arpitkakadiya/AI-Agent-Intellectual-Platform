@@ -8,6 +8,8 @@ assembly (high-precision).  Scoring is a weighted sum of:
 - **topic_relevance**: keyword overlap with the query
 - **source_quality**: primary/official sources score higher
 - **citation_density**: chunks that cite statutes, section numbers, etc.
+- **section_relevance**: heading/section title matches query tokens
+- **retrieval_agreement**: bonus when both vector and lexical retrieval agreed
 
 An optional LLM-assisted reranker can be enabled via
 ``RAG_LLM_RERANK_ENABLED=true`` in the environment.
@@ -23,11 +25,13 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 # Scoring weights (deterministic reranker)
-_W_JURISDICTION = 0.30
-_W_TOPIC = 0.25
-_W_CITATION = 0.20
-_W_SOURCE_QUALITY = 0.15
-_W_RECENCY = 0.10
+_W_JURISDICTION = 0.25
+_W_TOPIC = 0.20
+_W_CITATION = 0.15
+_W_SOURCE_QUALITY = 0.12
+_W_RECENCY = 0.08
+_W_SECTION = 0.10
+_W_AGREEMENT = 0.10
 
 _OFFICIAL_DOMAIN_PATTERNS = (
     r"\.gov\b",
@@ -108,6 +112,24 @@ def _recency_score(result: dict[str, Any]) -> float:
     return 0.3
 
 
+def _section_relevance_score(result: dict[str, Any], query_tokens: set[str]) -> float:
+    """Score based on section title / heading overlap with query."""
+    meta = result.get("metadata") or {}
+    title = (meta.get("section_title") or "").lower()
+    if not title or not query_tokens:
+        return 0.0
+    title_tokens = set(re.findall(r"\w+", title))
+    overlap = len(query_tokens & title_tokens)
+    return min(overlap / max(len(query_tokens), 1), 1.0)
+
+
+def _retrieval_agreement_score(result: dict[str, Any]) -> float:
+    """Bonus when a chunk appeared in both vector and lexical retrieval (hybrid)."""
+    if result.get("hybrid_score"):
+        return 0.6
+    return 0.0
+
+
 def rerank_deterministic(
     results: list[dict[str, Any]],
     query: str,
@@ -131,6 +153,8 @@ def rerank_deterministic(
             + _W_CITATION * _citation_score(r)
             + _W_SOURCE_QUALITY * _source_quality_score(r)
             + _W_RECENCY * _recency_score(r)
+            + _W_SECTION * _section_relevance_score(r, query_tokens)
+            + _W_AGREEMENT * _retrieval_agreement_score(r)
         )
         scored.append((s, idx, r))
 
@@ -142,6 +166,8 @@ def rerank_deterministic(
         entry = dict(r)
         entry["rerank_score"] = round(score, 4)
         out.append(entry)
+
+    logger.debug("Reranked %d → %d results (top score: %.4f)", len(results), len(out), out[0]["rerank_score"] if out else 0)
     return out
 
 

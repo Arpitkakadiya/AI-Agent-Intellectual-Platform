@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""Lightweight RAG evaluation harness for the compliance agent.
+"""RAG evaluation harness for the compliance agent.
 
 Usage:
     python scripts/rag_eval.py                    # run all eval cases
     python scripts/rag_eval.py --ids esa_dallas_basic out_of_scope
     python scripts/rag_eval.py --retrieval-only    # skip LLM answer eval
 
-Reads the eval dataset from data/eval/eval_dataset.json and evaluates:
-1. Retrieval quality  — did we retrieve chunks from the right jurisdictions/sources?
-2. Jurisdiction correctness — does the answer scope match expectations?
-3. Source/citation correctness — are expected sources mentioned?
-4. Answer completeness — are expected topics covered?
-5. Hallucination risk — does the answer contain unsupported claims?
-
-Prints a readable report with per-case pass/fail and aggregate metrics.
+Evaluates:
+1. Retrieval hit@k — did we retrieve chunks from the right jurisdictions/sources?
+2. Source grounding / citation presence — are citations present in the answer?
+3. Confidence label coverage — does every result carry a valid confidence label?
+4. Answer support heuristics — are expected topics covered?
+5. Regression checks for jurisdiction-sensitive questions
 """
 from __future__ import annotations
 
@@ -23,7 +21,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Ensure project root is on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -34,11 +31,16 @@ def load_eval_dataset(path: Path | None = None) -> list[dict[str, Any]]:
         return json.load(f)
 
 
+# ---------------------------------------------------------------------------
+# Evaluation functions
+# ---------------------------------------------------------------------------
+
+
 def evaluate_retrieval(
     sources: list[dict[str, Any]],
     expected: dict[str, Any],
 ) -> dict[str, Any]:
-    """Check whether retrieved sources match expectations."""
+    """Check whether retrieved sources match expectations (hit@k)."""
     results: dict[str, Any] = {"checks": [], "pass": True}
 
     should_retrieve = expected.get("should_retrieve_from") or []
@@ -47,14 +49,75 @@ def evaluate_retrieval(
         for s in sources
     ).lower()
 
+    hits = 0
     for loc in should_retrieve:
         found = loc.lower() in source_texts
         results["checks"].append({
-            "check": f"retrieval_from_{loc}",
+            "check": f"retrieval_hit_{loc}",
             "passed": found,
         })
-        if not found:
+        if found:
+            hits += 1
+        else:
             results["pass"] = False
+
+    total = len(should_retrieve) or 1
+    results["hit_at_k"] = hits / total
+
+    return results
+
+
+def evaluate_confidence(
+    confidence: str | None,
+    expected: dict[str, Any],
+) -> dict[str, Any]:
+    """Check confidence label is present and valid."""
+    results: dict[str, Any] = {"checks": [], "pass": True}
+    valid_labels = {"grounded", "weak_evidence", "conflicting", "out_of_scope"}
+
+    has_confidence = confidence is not None and confidence in valid_labels
+    results["checks"].append({
+        "check": "confidence_label_present",
+        "passed": has_confidence,
+    })
+    if not has_confidence:
+        results["pass"] = False
+
+    if expected.get("should_be_out_of_scope"):
+        is_oos = confidence == "out_of_scope"
+        results["checks"].append({
+            "check": "confidence_is_out_of_scope",
+            "passed": is_oos,
+        })
+        if not is_oos:
+            results["pass"] = False
+
+    return results
+
+
+def evaluate_grounding(
+    answer: str,
+    sources: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Check if the answer references sources and contains citation markers."""
+    results: dict[str, Any] = {"checks": [], "pass": True}
+
+    has_sources = len(sources) > 0
+    results["checks"].append({
+        "check": "sources_present",
+        "passed": has_sources,
+    })
+
+    import re
+    citation_re = re.compile(
+        r"§|Section\s+\d|Fair Housing|HUD|statute|regulation|Act\b",
+        re.IGNORECASE,
+    )
+    has_citation_language = bool(citation_re.search(answer))
+    results["checks"].append({
+        "check": "citation_language_present",
+        "passed": has_citation_language,
+    })
 
     return results
 
@@ -114,6 +177,11 @@ def evaluate_answer(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Single case runner
+# ---------------------------------------------------------------------------
+
+
 def run_single_eval(
     case: dict[str, Any],
     retrieval_only: bool = False,
@@ -136,41 +204,64 @@ def run_single_eval(
     confidence = result.get("confidence")
 
     retrieval_eval = evaluate_retrieval(sources, expected)
+    confidence_eval = evaluate_confidence(confidence, expected)
+    grounding_eval = evaluate_grounding(answer, sources)
 
     answer_eval: dict[str, Any] = {"checks": [], "pass": True}
     if not retrieval_only:
         answer_eval = evaluate_answer(answer, expected, confidence)
 
-    overall_pass = retrieval_eval["pass"] and answer_eval["pass"]
+    overall_pass = (
+        retrieval_eval["pass"]
+        and confidence_eval["pass"]
+        and answer_eval["pass"]
+    )
 
     return {
         "id": case["id"],
         "question": question,
         "overall_pass": overall_pass,
         "retrieval": retrieval_eval,
+        "confidence_eval": confidence_eval,
+        "grounding": grounding_eval,
         "answer": answer_eval,
         "confidence": confidence,
         "num_sources": len(sources),
         "answer_length": len(answer),
+        "hit_at_k": retrieval_eval.get("hit_at_k", 0),
     }
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
 
 
 def print_report(results: list[dict[str, Any]]) -> None:
     """Print a human-readable evaluation report."""
     total = len(results)
     passed = sum(1 for r in results if r["overall_pass"])
+    avg_hit_k = sum(r.get("hit_at_k", 0) for r in results) / max(total, 1)
+    confidence_labels = [r.get("confidence") for r in results]
+    confidence_coverage = sum(1 for c in confidence_labels if c is not None) / max(total, 1)
 
     print("\n" + "=" * 70)
     print(f"  RAG EVALUATION REPORT  —  {passed}/{total} passed")
+    print(f"  Avg hit@k: {avg_hit_k:.2f}  |  Confidence coverage: {confidence_coverage:.0%}")
     print("=" * 70)
 
     for r in results:
         status = "PASS" if r["overall_pass"] else "FAIL"
         print(f"\n  [{status}] {r['id']}")
         print(f"    Q: {r['question']}")
-        print(f"    Confidence: {r['confidence']}  |  Sources: {r['num_sources']}  |  Answer length: {r['answer_length']}")
+        print(f"    Confidence: {r['confidence']}  |  Sources: {r['num_sources']}  |  hit@k: {r.get('hit_at_k', 0):.2f}  |  Len: {r['answer_length']}")
 
-        all_checks = r["retrieval"]["checks"] + r["answer"]["checks"]
+        all_checks = (
+            r["retrieval"]["checks"]
+            + r["confidence_eval"]["checks"]
+            + r.get("grounding", {}).get("checks", [])
+            + r["answer"]["checks"]
+        )
         failed = [c for c in all_checks if not c["passed"]]
         if failed:
             for c in failed:
@@ -178,6 +269,8 @@ def print_report(results: list[dict[str, Any]]) -> None:
 
     print("\n" + "-" * 70)
     print(f"  TOTAL: {passed}/{total} passed ({100 * passed / max(total, 1):.0f}%)")
+    print(f"  Avg retrieval hit@k: {avg_hit_k:.2f}")
+    print(f"  Confidence label coverage: {confidence_coverage:.0%}")
     print("-" * 70 + "\n")
 
 
@@ -214,11 +307,14 @@ def main() -> None:
                 "id": case["id"],
                 "question": case["question"],
                 "overall_pass": False,
-                "retrieval": {"checks": [], "pass": False},
+                "retrieval": {"checks": [], "pass": False, "hit_at_k": 0},
+                "confidence_eval": {"checks": [], "pass": False},
+                "grounding": {"checks": [], "pass": True},
                 "answer": {"checks": [], "pass": False},
                 "confidence": "error",
                 "num_sources": 0,
                 "answer_length": 0,
+                "hit_at_k": 0,
             })
 
     print_report(results)

@@ -1,3 +1,18 @@
+"""End-to-end RAG QA orchestrator.
+
+Follows the upgraded pipeline:
+1. Resolve effective question (follow-up handling)
+2. Validate domain scope
+3. Build jurisdiction-aware retrieval plan
+4. Run hybrid retrieval (vector + lexical + RRF) when enabled
+5. Fall back to vector-only when hybrid is disabled or returns too little
+6. Merge and normalize candidate results
+7. Run deterministic reranking
+8. Build grounded context from top reranked chunks
+9. Assess confidence and detect evidence weakness/conflicts
+10. Generate final grounded answer with clear source attribution
+11. Return structured result
+"""
 from __future__ import annotations
 
 import logging
@@ -9,7 +24,6 @@ from config import settings
 from core.llm.client import llm
 from core.llm.prompts import QA_SYSTEM_PROMPT
 from core.rag.grounding import (
-    GroundedAnswer,
     assess_confidence,
     build_grounded_answer,
     build_grounded_context,
@@ -19,21 +33,14 @@ from core.rag.hybrid import hybrid_search, vector_search
 from core.rag.jurisdiction import (
     ScopedJurisdiction,
     build_retrieval_plan,
-    detect_jurisdiction_conflicts,
 )
 from core.rag.reranker import rerank
-from core.rag.utils import deduplicate_sources
-from core.rag.vector_store import RegulationVectorStore, SearchResult
+from core.rag.vector_store import RegulationVectorStore
 from db.client import get_db
 
 logger = logging.getLogger(__name__)
 
-_MAX_CONTEXT_RESULTS = 5
-_MAX_CONTEXT_CROSS_JURISDICTION = 8
 _MAX_HISTORY_ITEMS = 6
-_SEARCH_CANDIDATES = 5
-_MIN_INFORMATIVE_CHARS = 220
-_MAX_CHUNKS_PER_SOURCE = 2
 
 # US states + DC for multi-state / comparison detection (lowercase tokens).
 _US_STATE_NAMES: frozenset[str] = frozenset(
@@ -147,7 +154,6 @@ _US_STATE_ABBREVS: frozenset[str] = frozenset(
     }
 )
 
-# Improves embedding match: corpora say "assistance animal" more often than "ESA".
 _RETRIEVAL_ESA_HINT = (
     "emotional support animal assistance animal reasonable accommodation "
     "Fair Housing Act HUD"
@@ -184,6 +190,10 @@ _SCOPE_KEYWORDS: frozenset[str] = frozenset(
     }
 )
 
+# ---------------------------------------------------------------------------
+# Helper functions (domain scope, follow-ups, state detection)
+# ---------------------------------------------------------------------------
+
 
 def _is_in_scope_question(question: str) -> bool:
     q = (question or "").strip().lower()
@@ -196,7 +206,6 @@ def _is_followup_question(question: str) -> bool:
     q = (question or "").strip().lower()
     if not q:
         return False
-
     followup_markers = (
         "what about",
         "how about",
@@ -229,24 +238,17 @@ def _latest_user_turn(chat_history: list[dict[str, Any]], current_q: str) -> str
 
 
 def _effective_question(question: str, chat_history: list[dict[str, Any]]) -> str:
-    """
-    Resolve follow-ups by borrowing the previous user intent from chat memory.
-    This is intentionally general and not tied to any specific category or state.
-    """
+    """Resolve follow-ups by borrowing the previous user intent from chat memory."""
     q = (question or "").strip()
     if not q:
         return q
-
     if _is_in_scope_question(q):
         return q
-
     if not _is_followup_question(q):
         return q
-
     last_user = _latest_user_turn(chat_history, q)
     if not last_user:
         return q
-
     return f"{last_user}\nFollow-up constraint: {q}"
 
 
@@ -264,15 +266,14 @@ def _out_of_scope_answer() -> str:
 
 
 def _states_mentioned(question: str) -> list[str]:
-    """Return canonical state tokens found in the question (names or abbreviations)."""
+    """Return canonical state tokens found in the question."""
     ql = (question or "").lower()
     found: list[str] = []
     seen: set[str] = set()
     for name in _US_STATE_NAMES:
         if re.search(rf"\b{re.escape(name)}\b", ql):
-            key = name
-            if key not in seen:
-                seen.add(key)
+            if name not in seen:
+                seen.add(name)
                 found.append(name.title())
     for ab in _US_STATE_ABBREVS:
         if re.search(rf"\b{re.escape(ab)}\b", ql):
@@ -284,16 +285,10 @@ def _states_mentioned(question: str) -> list[str]:
 
 
 def _needs_cross_jurisdiction_retrieval(question: str) -> bool:
-    """
-    True when the sidebar jurisdiction filter would hide relevant materials
-    (e.g. comparing CA vs TX while only Texas is selected).
-    """
     ql = (question or "").lower()
     states = _states_mentioned(question)
-    unique_states = {s.lower() for s in states}
-    if len(unique_states) >= 2:
+    if len({s.lower() for s in states}) >= 2:
         return True
-
     broad_phrases = (
         "all states",
         "every state",
@@ -308,7 +303,6 @@ def _needs_cross_jurisdiction_retrieval(question: str) -> bool:
     )
     if any(p in ql for p in broad_phrases):
         return True
-
     compare_markers = (
         "compare",
         "comparison",
@@ -326,19 +320,13 @@ def _needs_cross_jurisdiction_retrieval(question: str) -> bool:
         "difference between",
         "differences between",
     )
-    if any(m in ql for m in compare_markers):
-        return True
-
-    return False
+    return any(m in ql for m in compare_markers)
 
 
 def _retrieval_jurisdiction_ids(
     question: str, sidebar_jurisdiction_id: int | None
 ) -> list[int]:
-    """
-    Jurisdiction DB ids to search separately (OR semantics via merge).
-    Includes federal, every state mentioned in the question, and the sidebar selection.
-    """
+    """Jurisdiction DB ids to search (OR semantics via merge)."""
     db = get_db()
     ids: list[int] = []
 
@@ -387,85 +375,6 @@ def _retrieval_jurisdiction_ids(
     return out
 
 
-def _merge_vector_hits(hits: list[SearchResult]) -> list[dict[str, Any]]:
-    by_row: dict[int, SearchResult] = {}
-    seen_fp: set[str] = set()
-    extras: list[SearchResult] = []
-
-    for r in hits:
-        rid = r.row_id
-        if rid is not None:
-            prev = by_row.get(rid)
-            if prev is None or r.score > prev.score:
-                by_row[rid] = r
-        else:
-            fp = f"{(r.metadata or {}).get('source_name', '')}|{(r.document or '')[:200]}"
-            if fp not in seen_fp:
-                seen_fp.add(fp)
-                extras.append(r)
-
-    merged = list(by_row.values()) + extras
-    merged.sort(key=lambda x: x.score, reverse=True)
-    return [
-        {"document": r.document, "metadata": r.metadata, "score": r.score}
-        for r in merged
-    ]
-
-
-def _diversify_by_source(
-    results: list[dict[str, Any]], max_items: int
-) -> list[dict[str, Any]]:
-    """Prefer multiple sources so comparisons are not five chunks from one URL."""
-    by_score = sorted(
-        results, key=lambda r: float(r.get("score") or 0.0), reverse=True
-    )
-    picked: list[dict[str, Any]] = []
-    per_source: dict[str, int] = {}
-    for r in by_score:
-        meta = r.get("metadata") or {}
-        src = str(meta.get("source_name") or meta.get("url") or "")
-        n = per_source.get(src, 0)
-        if n >= _MAX_CHUNKS_PER_SOURCE:
-            continue
-        per_source[src] = n + 1
-        picked.append(r)
-        if len(picked) >= max_items:
-            break
-    if len(picked) < max_items:
-        for r in by_score:
-            if r in picked:
-                continue
-            picked.append(r)
-            if len(picked) >= max_items:
-                break
-    return picked
-
-
-def _build_context(results: list[dict[str, Any]], max_blocks: int) -> str:
-    blocks: list[str] = []
-    for r in results[:max_blocks]:
-        meta = r.get("metadata") or {}
-        header = meta.get("source_name") or meta.get("url") or "Source"
-        blocks.append(f"[{header}]\n{r['document']}")
-    return "\n---\n".join(blocks)
-
-
-def _build_history(chat_history: list[dict[str, Any]]) -> str:
-    recent = chat_history[-_MAX_HISTORY_ITEMS:]
-    lines: list[str] = []
-    for msg in recent:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        lines.append(f"{role}: {content}")
-    return "\n".join(lines)
-
-
-def _clean_answer(text: str) -> str:
-    cleaned = _CONTEXT_LEAK_RE.sub("", text)
-    cleaned = _NOTE_SUFFIX_RE.sub("", cleaned)
-    return cleaned.strip()
-
-
 def _retrieval_query(question: str) -> str:
     q = (question or "").strip()
     ql = q.lower()
@@ -486,86 +395,171 @@ def _infer_category_filter(question: str) -> str | None:
         return "Rent Control"
     if "rental insurance" in ql or "renters insurance" in ql:
         return "Rental insurance"
-    if (
-        "esa" in ql
-        or "emotional support" in ql
-        or "assistance animal" in ql
-        or "service animal" in ql
-    ):
+    if "esa" in ql or "emotional support" in ql or "assistance animal" in ql or "service animal" in ql:
         return "ESA"
     if "pet policy" in ql or ("pet" in ql and "policy" in ql):
         return "Pet Policy"
-    if (
-        "tenant" in ql
-        or "landlord" in ql
-        or "security deposit" in ql
-        or "habitability" in ql
-        or "evict" in ql
-        or "eviction" in ql
-    ):
+    if "tenant" in ql or "landlord" in ql or "security deposit" in ql or "habitability" in ql or "evict" in ql or "eviction" in ql:
         return "Renters"
     return None
 
 
-def _extract_sources(
-    results: list[dict[str, Any]], max_items: int
-) -> list[dict[str, Any]]:
-    raw: list[dict[str, Any]] = []
-    for r in results[:max_items]:
-        meta = r.get("metadata") or {}
-        raw.append(
-            {
-                "source": meta.get("source_name", ""),
-                "url": meta.get("url", ""),
-                "category": meta.get("category", ""),
-                "domain": meta.get("domain", ""),
-            }
-        )
-    return deduplicate_sources(raw)
-
-
-def _is_informative_chunk(text: str) -> bool:
+def _is_informative_chunk(text: str, min_chars: int) -> bool:
     t = (text or "").strip()
-    if len(t) < _MIN_INFORMATIVE_CHARS:
+    if len(t) < min_chars:
         return False
-    # Skip noisy title/url-only chunks that can outrank useful legal text.
     if t.count("http") >= 1 and "\n" not in t and "." not in t[:120]:
         return False
     return True
 
 
-def _build_source_based_overview(
-    question: str, sources: list[dict[str, Any]], category_filter: str | None
-) -> str | None:
-    if not sources:
-        return None
-
-    labels = [str(s.get("source") or "").strip() for s in sources if s.get("source")]
-    labels = [x for x in labels if x]
-    if not labels:
-        return None
-
-    topic = category_filter or "the requested topic"
-    top = labels[:5]
-    bullets = "\n".join(f"- {name}" for name in top)
-    return (
-        f"Here is a high-level overview of {topic} based on the regulation sources in this system.\n\n"
-        f"- This topic is covered by multiple official/legal references.\n"
-        f"- Rules vary by jurisdiction, so exact requirements can differ by state/city.\n"
-        f"- For compliance decisions, use the linked primary sources below.\n\n"
-        f"Most relevant sources found:\n{bullets}\n\n"
-        f"If you want, I can summarize this specifically for a state/city (for example: "
-        f"\"{question} in Colorado\")."
+def _diversify_by_source(
+    results: list[dict[str, Any]], max_items: int, max_per_source: int
+) -> list[dict[str, Any]]:
+    """Prefer multiple sources so comparisons aren't dominated by one URL."""
+    by_score = sorted(
+        results, key=lambda r: float(r.get("rerank_score") or r.get("score") or 0.0), reverse=True
     )
+    picked: list[dict[str, Any]] = []
+    per_source: dict[str, int] = {}
+    for r in by_score:
+        meta = r.get("metadata") or {}
+        src = str(meta.get("source_name") or meta.get("url") or "")
+        n = per_source.get(src, 0)
+        if n >= max_per_source:
+            continue
+        per_source[src] = n + 1
+        picked.append(r)
+        if len(picked) >= max_items:
+            break
+    if len(picked) < max_items:
+        for r in by_score:
+            if r in picked:
+                continue
+            picked.append(r)
+            if len(picked) >= max_items:
+                break
+    return picked
+
+
+def _build_history(chat_history: list[dict[str, Any]]) -> str:
+    recent = chat_history[-_MAX_HISTORY_ITEMS:]
+    lines: list[str] = []
+    for msg in recent:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def _clean_answer(text: str) -> str:
+    cleaned = _CONTEXT_LEAK_RE.sub("", text)
+    cleaned = _NOTE_SUFFIX_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+# ---------------------------------------------------------------------------
+# Primary retrieval orchestration
+# ---------------------------------------------------------------------------
+
+
+def _run_hybrid_retrieval(
+    store: RegulationVectorStore,
+    q_text: str,
+    top_n: int,
+    plan_jids: list[int],
+    category_filter: str | None,
+) -> list[dict[str, Any]]:
+    """Run hybrid retrieval (vector + lexical + RRF)."""
+    return hybrid_search(
+        store,
+        query=q_text,
+        n_results=top_n,
+        jurisdiction_ids=plan_jids or None,
+        category_filter=category_filter,
+    )
+
+
+def _run_vector_retrieval(
+    store: RegulationVectorStore,
+    q_text: str,
+    top_n: int,
+    plan_jids: list[int],
+    jurisdiction_id: int | None,
+    category_filter: str | None,
+    cross: bool,
+) -> list[dict[str, Any]]:
+    """Run vector-only retrieval (fallback or when hybrid is disabled)."""
+    if cross or plan_jids:
+        return vector_search(
+            store,
+            query=q_text,
+            n_results=top_n,
+            jurisdiction_ids=plan_jids or None,
+            category_filter=category_filter,
+        )
+    search_results = store.search(
+        query=q_text,
+        n_results=top_n,
+        jurisdiction_id=jurisdiction_id,
+        category_filter=category_filter,
+    )
+    return [
+        {"document": r.document, "metadata": r.metadata, "score": r.score}
+        for r in search_results
+    ]
+
+
+def _run_fallback_broadening(
+    store: RegulationVectorStore,
+    q_text: str,
+    top_n: int,
+    category_filter: str | None,
+) -> list[dict[str, Any]]:
+    """Progressively broaden search: drop jurisdiction, then drop category."""
+    try:
+        fb1 = store.search(
+            query=q_text,
+            n_results=top_n,
+            jurisdiction_id=None,
+            category_filter=category_filter,
+        )
+        if fb1:
+            logger.debug("Fallback: broadened jurisdiction, got %d results", len(fb1))
+            return [
+                {"document": r.document, "metadata": r.metadata, "score": r.score}
+                for r in fb1
+            ]
+    except Exception:
+        pass
+
+    try:
+        fb2 = store.search(
+            query=q_text,
+            n_results=top_n,
+            jurisdiction_id=None,
+            category_filter=None,
+        )
+        if fb2:
+            logger.debug("Fallback: broadened jurisdiction+category, got %d results", len(fb2))
+            return [
+                {"document": r.document, "metadata": r.metadata, "score": r.score}
+                for r in fb2
+            ]
+    except Exception:
+        pass
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# QA System class
+# ---------------------------------------------------------------------------
 
 
 class QASystem:
     def __init__(self) -> None:
         self._store = RegulationVectorStore()
-
-    # ------------------------------------------------------------------
-    # Primary entry point (backward-compatible dict return)
-    # ------------------------------------------------------------------
 
     def answer_question(
         self,
@@ -573,18 +567,30 @@ class QASystem:
         chat_history: list[dict[str, Any]],
         jurisdiction_id: int | None = None,
     ) -> dict[str, Any]:
-        effective_question = _effective_question(question, chat_history)
-        if not _is_in_scope_question(effective_question):
+        """Primary entry point (backward-compatible dict return).
+
+        Orchestrates: question resolution → scope check → jurisdiction plan
+        → hybrid retrieval → fallback → rerank → grounding → LLM answer.
+        """
+        # ---- 1. Resolve effective question ----
+        effective_q = _effective_question(question, chat_history)
+
+        # ---- 2. Validate domain scope ----
+        if not _is_in_scope_question(effective_q):
             return {"answer": _out_of_scope_answer(), "sources": [], "confidence": "out_of_scope"}
 
-        cross = _needs_cross_jurisdiction_retrieval(effective_question)
-        max_context = _MAX_CONTEXT_CROSS_JURISDICTION if cross else _MAX_CONTEXT_RESULTS
-        q_text = _retrieval_query(effective_question)
-        category_filter = _infer_category_filter(effective_question)
-        top_n = getattr(settings, "RAG_RETRIEVAL_TOP_N", 15)
-        top_k = getattr(settings, "RAG_RERANK_TOP_K", max_context)
+        # ---- 3. Read config-driven RAG settings ----
+        cross = _needs_cross_jurisdiction_retrieval(effective_q)
+        max_context = settings.RAG_CROSS_JURISDICTION_MAX if cross else settings.RAG_RERANK_TOP_K
+        q_text = _retrieval_query(effective_q)
+        category_filter = _infer_category_filter(effective_q)
+        top_n = settings.RAG_RETRIEVAL_TOP_N
+        top_k = settings.RAG_RERANK_TOP_K
+        min_chars = settings.RAG_MIN_INFORMATIVE_CHARS
+        max_per_source = settings.RAG_MAX_CHUNKS_PER_SOURCE
+        use_hybrid = settings.RAG_HYBRID_ENABLED
 
-        # ----- 1. Build jurisdiction retrieval plan -----
+        # ---- 4. Build jurisdiction-aware retrieval plan ----
         mentioned_jids = _retrieval_jurisdiction_ids(question, jurisdiction_id)
         scoped: list[ScopedJurisdiction] = []
         try:
@@ -600,102 +606,71 @@ class QASystem:
         plan_jids = [sj.jurisdiction_id for sj in scoped] if scoped else mentioned_jids
         exact_jid = jurisdiction_id
 
-        # ----- 2. Hybrid retrieval -----
-        use_hybrid = getattr(settings, "RAG_HYBRID_ENABLED", True)
+        logger.debug(
+            "RAG pipeline: hybrid=%s, cross=%s, top_n=%d, top_k=%d, plan_jids=%s",
+            use_hybrid, cross, top_n, top_k, plan_jids,
+        )
+
+        # ---- 5. Hybrid retrieval first when enabled ----
+        result_dicts: list[dict[str, Any]] = []
         fallback_used = False
 
         try:
             if use_hybrid:
-                result_dicts = hybrid_search(
-                    self._store,
-                    query=q_text,
-                    n_results=top_n,
-                    jurisdiction_ids=plan_jids or None,
-                    category_filter=category_filter,
+                result_dicts = _run_hybrid_retrieval(
+                    self._store, q_text, top_n, plan_jids, category_filter
                 )
-            elif cross:
-                result_dicts = vector_search(
-                    self._store,
-                    query=q_text,
-                    n_results=top_n,
-                    jurisdiction_ids=plan_jids or None,
-                    category_filter=category_filter,
+                logger.debug("Hybrid retrieval returned %d results", len(result_dicts))
+
+            # ---- 5b. Fall back to vector-only when hybrid disabled or empty ----
+            if not result_dicts:
+                if use_hybrid:
+                    logger.debug("Hybrid returned empty, falling back to vector-only")
+                result_dicts = _run_vector_retrieval(
+                    self._store, q_text, top_n, plan_jids,
+                    jurisdiction_id, category_filter, cross,
                 )
-            else:
-                search_results = self._store.search(
-                    query=q_text,
-                    n_results=top_n,
-                    jurisdiction_id=jurisdiction_id,
-                    category_filter=category_filter,
-                )
-                result_dicts = [
-                    {"document": r.document, "metadata": r.metadata, "score": r.score}
-                    for r in search_results
-                ]
+                if use_hybrid and result_dicts:
+                    fallback_used = True
+                logger.debug("Vector retrieval returned %d results", len(result_dicts))
         except Exception:
             if llm.is_ai_available():
                 raise
             result_dicts = []
 
-        # ----- 2b. Fallback: broaden jurisdiction, then remove category -----
+        # ---- 6. Fallback: broaden jurisdiction, then remove category ----
         if not result_dicts:
             fallback_used = True
-            try:
-                fb1 = self._store.search(
-                    query=q_text,
-                    n_results=top_n,
-                    jurisdiction_id=None,
-                    category_filter=category_filter,
-                )
-                result_dicts = [
-                    {"document": r.document, "metadata": r.metadata, "score": r.score}
-                    for r in fb1
-                ]
-            except Exception:
-                pass
+            result_dicts = _run_fallback_broadening(
+                self._store, q_text, top_n, category_filter
+            )
 
-        if not result_dicts:
-            fallback_used = True
-            try:
-                fb2 = self._store.search(
-                    query=q_text,
-                    n_results=top_n,
-                    jurisdiction_id=None,
-                    category_filter=None,
-                )
-                result_dicts = [
-                    {"document": r.document, "metadata": r.metadata, "score": r.score}
-                    for r in fb2
-                ]
-            except Exception:
-                pass
-
-        # ----- 3. Filter non-informative chunks -----
+        # ---- 7. Filter non-informative chunks ----
         informative_results = [
-            r for r in result_dicts if _is_informative_chunk(str(r.get("document") or ""))
+            r for r in result_dicts if _is_informative_chunk(str(r.get("document") or ""), min_chars)
         ]
         pool = informative_results or result_dicts
 
-        # ----- 4. Rerank -----
+        # ---- 8. Deterministic reranking ----
         reranked = rerank(
             pool,
             query=q_text,
             target_jurisdiction_ids=plan_jids,
             exact_jurisdiction_id=exact_jid,
-            top_k=top_k,
+            top_k=top_k if not cross else max(top_k, max_context),
         )
 
-        # Diversify by source for cross-jurisdiction comparisons
+        # ---- 9. Diversify by source for cross-jurisdiction ----
         selected_results = (
-            _diversify_by_source(reranked, max_context)
+            _diversify_by_source(reranked, max_context, max_per_source)
             if cross
             else reranked[:max_context]
         )
 
-        # ----- 5. Assess confidence -----
+        # ---- 10. Assess confidence from evidence quality ----
         confidence, conflict_notices = assess_confidence(selected_results, scoped)
 
-        # ----- 6. No-LLM fallback -----
+        # ---- 11. No-LLM fallback ----
         sources = extract_sources(selected_results, max_context, scoped)
 
         if not llm.is_ai_available():
@@ -710,7 +685,7 @@ class QASystem:
                 "confidence": "weak_evidence",
             }
 
-        # ----- 7. Build grounded context + prompt -----
+        # ---- 12. Build grounded context + prompt ----
         context = build_grounded_context(selected_results, scoped, max_context)
         history = _build_history(chat_history)
 
@@ -759,13 +734,13 @@ class QASystem:
             f"{thin_context_note}"
             f"{confidence_instruction}"
             f"Question: {question}\n"
-            f"Resolved intent for retrieval: {effective_question}"
+            f"Resolved intent for retrieval: {effective_q}"
         )
 
         raw_answer = llm.ask(system=QA_SYSTEM_PROMPT, user=user_message)
         answer = _clean_answer(raw_answer)
 
-        # ----- 8. Build structured grounded answer -----
+        # ---- 13. Build structured grounded answer ----
         grounded = build_grounded_answer(
             answer_text=answer,
             results=selected_results,
@@ -774,6 +749,11 @@ class QASystem:
             scoped_jurisdictions=scoped,
             fallback_used=fallback_used,
             max_sources=max_context,
+        )
+
+        logger.debug(
+            "QA complete: confidence=%s, sources=%d, fallback=%s",
+            grounded.confidence, len(grounded.sources), grounded.fallback_used,
         )
 
         return grounded.to_dict()

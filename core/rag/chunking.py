@@ -43,6 +43,14 @@ _DEFINITION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CITATION_RE = re.compile(
+    r"§\s*[\d.]+|"
+    r"\b(?:Sec(?:tion)?|SEC(?:TION)?)\s*\.?\s*[\d.\-]+|"
+    r"\b\d+\s+(?:U\.?S\.?C\.?|C\.?F\.?R\.?)\s*§?\s*\d+|"
+    r"\b(?:Public Law|P\.?L\.?)\s+\d+[\-–]\d+",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class ChunkMeta:
@@ -52,7 +60,22 @@ class ChunkMeta:
     total_chunks: int = 0
     has_definitions: bool = False
     has_effective_date: bool = False
+    citation_hint: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "section_title": self.section_title,
+            "chunk_index": self.chunk_index,
+            "total_chunks": self.total_chunks,
+            "has_definitions": self.has_definitions,
+            "has_effective_date": self.has_effective_date,
+        }
+        if self.citation_hint:
+            d["citation_hint"] = self.citation_hint
+        if self.extra:
+            d.update(self.extra)
+        return d
 
 
 def _find_section_boundaries(text: str) -> list[int]:
@@ -128,6 +151,12 @@ def _split_oversized_section(
     return chunks
 
 
+def _extract_citation_hint(text: str) -> str:
+    """Extract first legal citation found in a chunk for metadata."""
+    m = _CITATION_RE.search(text)
+    return m.group(0).strip() if m else ""
+
+
 def chunk_legal_text(
     text: str,
     *,
@@ -144,12 +173,16 @@ def chunk_legal_text(
        sliding window.
     4. If no section markers are found, fall back to sliding window.
 
+    ``source_metadata`` (if provided) is merged into each chunk's
+    ``extra`` dict so downstream indexing/retrieval can access it.
+
     Returns a list of ``(chunk_text, chunk_meta)`` tuples.
     """
     t = (text or "").strip()
     if not t:
         return []
 
+    extra = dict(source_metadata or {})
     boundaries = _find_section_boundaries(t)
 
     if not boundaries:
@@ -163,6 +196,8 @@ def chunk_legal_text(
                     total_chunks=total,
                     has_definitions=bool(_DEFINITION_RE.search(c)),
                     has_effective_date=bool(_EFFECTIVE_DATE_RE.search(c)),
+                    citation_hint=_extract_citation_hint(c),
+                    extra=dict(extra),
                 ),
             )
             for i, c in enumerate(raw_chunks)
@@ -190,6 +225,8 @@ def chunk_legal_text(
                 section_title=title,
                 has_definitions=bool(_DEFINITION_RE.search(sc)),
                 has_effective_date=bool(_EFFECTIVE_DATE_RE.search(sc)),
+                citation_hint=_extract_citation_hint(sc),
+                extra=dict(extra),
             )
             result.append((sc, meta))
 

@@ -3,11 +3,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from config import CHUNK_OVERLAP, CHUNK_SIZE, MAX_CONTEXT_CHARS, settings
+from config import CHUNK_OVERLAP, CHUNK_SIZE, EMBEDDING_DIMS, MAX_CONTEXT_CHARS, settings
 
 from pydantic import BaseModel
 
-from core.llm.client import llm
+from core.llm.client import EmbeddingError, llm
 from db.client import get_db
 
 logger = logging.getLogger(__name__)
@@ -21,19 +21,46 @@ class SearchResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Embedding dimension validation
+# ---------------------------------------------------------------------------
+
+def validate_embedding_dims(embedding: list[float], context: str = "") -> None:
+    """Raise if the embedding dimension doesn't match the expected DB schema."""
+    actual = len(embedding)
+    if actual != EMBEDDING_DIMS:
+        ctx = f" ({context})" if context else ""
+        raise EmbeddingError(
+            f"Embedding dimension mismatch{ctx}: got {actual}, "
+            f"expected {EMBEDDING_DIMS}. Check EMBED_PROVIDER and DB schema."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Backward-compatible chunking entry point
 # ---------------------------------------------------------------------------
 
 def _chunk_text(
-    text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP
-) -> list[str]:
-    """Chunk text using legal-aware splitter when enabled, else sliding window."""
+    text: str,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
+    source_metadata: dict[str, Any] | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Chunk text, returning (chunk_text, chunk_metadata) pairs.
+
+    Uses legal-aware splitter when enabled, else sliding window.
+    """
     if settings.RAG_USE_LEGAL_CHUNKING:
         from core.rag.chunking import chunk_legal_text
-        pairs = chunk_legal_text(text, chunk_size=chunk_size, overlap=overlap)
-        return [chunk for chunk, _meta in pairs]
+        pairs = chunk_legal_text(
+            text,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            source_metadata=source_metadata,
+        )
+        return [(chunk, meta.to_dict()) for chunk, meta in pairs]
 
-    return _sliding_window_chunk(text, chunk_size, overlap)
+    raw = _sliding_window_chunk(text, chunk_size, overlap)
+    return [(chunk, dict(source_metadata or {})) for chunk in raw]
 
 
 def _sliding_window_chunk(
@@ -71,7 +98,8 @@ def _sliding_window_chunk(
 
 class RegulationVectorStore:
     def add_documents(self, docs: list[dict[str, Any]]) -> None:
-        """
+        """Index documents with legal-aware chunking and metadata.
+
         Each doc: {"text": str, "regulation_id": int, "metadata": dict}
         """
         if not docs:
@@ -91,25 +119,40 @@ class RegulationVectorStore:
                 ).execute()
 
         rows: list[dict[str, Any]] = []
+        dim_validated = False
         for doc in docs:
             text = str(doc.get("text") or "")
             regulation_id = int(doc["regulation_id"])
-            for chunk in _chunk_text(text):
-                embedding = llm.embed(chunk)
-                rows.append(
-                    {
-                        "regulation_id": regulation_id,
-                        "embedding": embedding,
-                        "chunk_text": chunk,
-                    }
-                )
+            source_meta = doc.get("metadata") or {}
+            chunks = _chunk_text(text, source_metadata=source_meta)
+            for chunk_text, chunk_meta in chunks:
+                embedding = llm.embed(chunk_text)
+                if not dim_validated:
+                    validate_embedding_dims(embedding, context="indexing")
+                    dim_validated = True
+                row: dict[str, Any] = {
+                    "regulation_id": regulation_id,
+                    "embedding": embedding,
+                    "chunk_text": chunk_text,
+                }
+                if chunk_meta:
+                    row["chunk_metadata"] = chunk_meta
+                rows.append(row)
 
         if not rows:
             return
 
         batch_size = 100
         for i in range(0, len(rows), batch_size):
-            db.table("regulation_embeddings").insert(rows[i : i + batch_size]).execute()
+            batch = rows[i : i + batch_size]
+            try:
+                db.table("regulation_embeddings").insert(batch).execute()
+            except Exception:
+                stripped = [
+                    {k: v for k, v in r.items() if k != "chunk_metadata"}
+                    for r in batch
+                ]
+                db.table("regulation_embeddings").insert(stripped).execute()
 
     def search(
         self,
@@ -123,6 +166,7 @@ class RegulationVectorStore:
         db = get_db()
 
         qemb = query_embedding if query_embedding is not None else llm.embed(query)
+        validate_embedding_dims(qemb, context="query")
         payload: dict[str, Any] = {
             "query_embedding": qemb,
             "match_count": int(n_results),
@@ -145,6 +189,7 @@ class RegulationVectorStore:
         db = get_db()
 
         qemb = query_embedding if query_embedding is not None else llm.embed(query)
+        validate_embedding_dims(qemb, context="query_v3")
         payload: dict[str, Any] = {
             "query_embedding": qemb,
             "match_count": int(n_results),

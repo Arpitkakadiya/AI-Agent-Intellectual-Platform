@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import re
 from pathlib import Path
-from typing import Union
+from typing import Any, Union
 
 from pydantic import BaseModel
 
@@ -79,6 +79,36 @@ def parse_pdf(source: Union[str, Path, bytes, io.BytesIO]) -> ParsedDocument:
     return ParsedDocument(text=full_text, clauses=clauses)
 
 
+def _extract_table_text(table: Any) -> str:
+    """Extract all text from a docx table, preserving row/cell structure."""
+    rows: list[str] = []
+    for row in table.rows:
+        cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+        if cells:
+            rows.append(" | ".join(cells))
+    return "\n".join(rows)
+
+
+def _iter_docx_body_elements(doc: Any) -> list[str]:
+    """Walk the document body in order, extracting paragraphs and tables."""
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    parts: list[str] = []
+    for element in doc.element.body:
+        if element.tag.endswith("}p"):
+            para = Paragraph(element, doc)
+            text = para.text.strip()
+            if text:
+                parts.append(text)
+        elif element.tag.endswith("}tbl"):
+            table = Table(element, doc)
+            table_text = _extract_table_text(table)
+            if table_text:
+                parts.append(table_text)
+    return parts
+
+
 def parse_docx(source: Union[str, Path, bytes, io.BytesIO]) -> ParsedDocument:
     from docx import Document
 
@@ -89,8 +119,8 @@ def parse_docx(source: Union[str, Path, bytes, io.BytesIO]) -> ParsedDocument:
     else:
         doc = Document(source)
 
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-    full_text = "\n".join(paragraphs)
+    parts = _iter_docx_body_elements(doc)
+    full_text = "\n".join(parts)
     clauses = extract_clauses(full_text)
     return ParsedDocument(text=full_text, clauses=clauses)
 

@@ -9,7 +9,7 @@ from config import settings
 from core.compliance.parser import parse_document
 from core.compliance.rules import RuleEngine, rule_engine
 from core.llm.client import llm
-from core.llm.prompts import COMPLIANCE_SYSTEM_PROMPT
+from core.llm.prompts import COMPLIANCE_SYSTEM_PROMPT, DOCUMENT_QA_SYSTEM_PROMPT
 from core.rag.utils import deduplicate_sources
 from db.models import InsuranceRequirement, PetPolicy
 
@@ -115,29 +115,47 @@ def _load_jurisdiction_rules(db: Any, jurisdiction_id: int) -> dict[str, Any]:
 
     pet_model: Optional[PetPolicy] = None
     for jid in chain:
-        pet_res = (
-            db.table("pet_policies")
-            .select("*")
-            .eq("jurisdiction_id", int(jid))
-            .limit(1)
-            .execute()
-        )
-        if pet_res.data:
-            pet_model = PetPolicy.model_validate(pet_res.data[0])
-            break
+        try:
+            pet_res = (
+                db.table("pet_policies")
+                .select("*")
+                .eq("jurisdiction_id", int(jid))
+                .limit(1)
+                .execute()
+            )
+            if pet_res.data:
+                pet_model = PetPolicy.model_validate(pet_res.data[0])
+                break
+        except Exception as exc:
+            if "permission denied" in str(exc).lower():
+                raise PermissionError(
+                    "Permission denied for table pet_policies. "
+                    "Run db/migrations/010_pet_insurance_rls.sql in the Supabase SQL Editor, "
+                    "or use a service_role key. See LOCAL_DEVELOPMENT.md step 6."
+                ) from exc
+            raise
 
     insurance_model: Optional[InsuranceRequirement] = None
     for jid in chain:
-        ins_res = (
-            db.table("insurance_requirements")
-            .select("*")
-            .eq("jurisdiction_id", int(jid))
-            .limit(1)
-            .execute()
-        )
-        if ins_res.data:
-            insurance_model = InsuranceRequirement.model_validate(ins_res.data[0])
-            break
+        try:
+            ins_res = (
+                db.table("insurance_requirements")
+                .select("*")
+                .eq("jurisdiction_id", int(jid))
+                .limit(1)
+                .execute()
+            )
+            if ins_res.data:
+                insurance_model = InsuranceRequirement.model_validate(ins_res.data[0])
+                break
+        except Exception as exc:
+            if "permission denied" in str(exc).lower():
+                raise PermissionError(
+                    "Permission denied for table insurance_requirements. "
+                    "Run db/migrations/010_pet_insurance_rls.sql in the Supabase SQL Editor, "
+                    "or use a service_role key. See LOCAL_DEVELOPMENT.md step 6."
+                ) from exc
+            raise
 
     jurisdiction_rules: dict[str, Any] = {}
 
@@ -343,6 +361,59 @@ class ComplianceChecker:
         # Ensure summary is generated from final result.
         result.summary = generate_summary(result, jurisdiction_name=jurisdiction_name)
         return result
+
+
+    def document_qa(
+        self,
+        question: str,
+        file_bytes: bytes,
+        filename: str,
+        chat_history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Answer a question about an uploaded document using its parsed text."""
+        parsed = parse_document(file_bytes, filename)
+        doc_text = parsed.text
+
+        max_chars = 30000
+        if len(doc_text) > max_chars:
+            doc_text = doc_text[:max_chars] + "\n\n[... document truncated for context length ...]"
+
+        history_block = ""
+        if chat_history:
+            recent = chat_history[-6:]
+            lines: list[str] = []
+            for msg in recent:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if len(content) > 300:
+                    content = content[:300] + "..."
+                lines.append(f"{role}: {content}")
+            history_block = f"Conversation history:\n" + "\n".join(lines) + "\n\n"
+
+        user_message = (
+            f"Document filename: {filename}\n\n"
+            f"Document content:\n{doc_text}\n\n"
+            f"{history_block}"
+            f"Question: {question}"
+        )
+
+        doc_source = {"source": filename, "url": ""}
+
+        if not llm.is_ai_available():
+            return {
+                "answer": (
+                    "I cannot answer questions about the document because no LLM API key "
+                    "is configured. Please set ANTHROPIC_API_KEY, OPENAI_API_KEY, or "
+                    "GOOGLE_API_KEY to enable document Q&A."
+                ),
+                "sources": [doc_source],
+            }
+
+        try:
+            raw_answer = llm.ask(system=DOCUMENT_QA_SYSTEM_PROMPT, user=user_message)
+            return {"answer": raw_answer.strip(), "sources": [doc_source]}
+        except Exception as exc:
+            return {"answer": f"Failed to analyze document: {exc}", "sources": [doc_source]}
 
 
 checker = ComplianceChecker()

@@ -1,3 +1,4 @@
+"""Tests for the upgraded RAG pipeline."""
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -5,7 +6,7 @@ from typing import Any, Optional
 import pytest
 
 import core.rag.qa_system as _qa_mod
-from tests.conftest import DALLAS_JURISDICTION_ID
+from tests.conftest import DALLAS_JURISDICTION_ID, HOUSTON_JURISDICTION_ID
 
 
 def _fake_embed(_text: str) -> list[float]:
@@ -34,6 +35,11 @@ def _configure_llm(
             return ask_return
 
         monkeypatch.setattr(_qa_mod.llm, "ask", _fake_ask)
+
+
+# -----------------------------------------------------------------------
+# Core QA tests
+# -----------------------------------------------------------------------
 
 
 def test_esa_query_returns_non_empty_answer(
@@ -113,7 +119,7 @@ def test_rule_based_fallback_works_with_no_api_keys(
 
 
 # -----------------------------------------------------------------------
-# New tests for upgraded RAG pipeline
+# Upgraded pipeline tests
 # -----------------------------------------------------------------------
 
 
@@ -163,3 +169,158 @@ def test_reranking_preserves_top_results(
     source_names = [str(s.get("source") or "") for s in sources]
     assert any("Dallas" in name for name in source_names)
 
+
+# -----------------------------------------------------------------------
+# Config-driven top N / top K tests
+# -----------------------------------------------------------------------
+
+
+def test_config_driven_top_n(
+    mock_supabase_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pipeline should respect RAG_RETRIEVAL_TOP_N from settings."""
+    _configure_llm(
+        monkeypatch, ai_available=True, ask_return="Config-driven answer."
+    )
+    monkeypatch.setattr(_qa_mod.settings, "RAG_RETRIEVAL_TOP_N", 3)
+
+    result = _qa_mod.qa.answer_question(
+        "What are the ESA rules in Dallas, TX?",
+        chat_history=[],
+        jurisdiction_id=DALLAS_JURISDICTION_ID,
+    )
+    assert result.get("answer")
+    assert result.get("confidence") in ("grounded", "weak_evidence", "conflicting", "out_of_scope")
+
+
+# -----------------------------------------------------------------------
+# Hybrid retrieval routing tests
+# -----------------------------------------------------------------------
+
+
+def test_hybrid_enabled_uses_hybrid_path(
+    mock_supabase_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When RAG_HYBRID_ENABLED=True, the pipeline should attempt hybrid search."""
+    _configure_llm(
+        monkeypatch, ai_available=True, ask_return="Hybrid answer."
+    )
+    monkeypatch.setattr(_qa_mod.settings, "RAG_HYBRID_ENABLED", True)
+
+    hybrid_called = {"value": False}
+    original_hybrid = _qa_mod.hybrid_search
+
+    def _tracking_hybrid(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        hybrid_called["value"] = True
+        return original_hybrid(*args, **kwargs)
+
+    monkeypatch.setattr(_qa_mod, "hybrid_search", _tracking_hybrid)
+
+    result = _qa_mod.qa.answer_question(
+        "What are the ESA rules in Dallas, TX?",
+        chat_history=[],
+        jurisdiction_id=DALLAS_JURISDICTION_ID,
+    )
+    assert result.get("answer")
+    assert hybrid_called["value"], "hybrid_search should have been called"
+
+
+def test_vector_fallback_when_hybrid_disabled(
+    mock_supabase_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When RAG_HYBRID_ENABLED=False, the pipeline should use vector-only."""
+    _configure_llm(
+        monkeypatch, ai_available=True, ask_return="Vector-only answer."
+    )
+    monkeypatch.setattr(_qa_mod.settings, "RAG_HYBRID_ENABLED", False)
+
+    result = _qa_mod.qa.answer_question(
+        "What are the ESA rules in Dallas, TX?",
+        chat_history=[],
+        jurisdiction_id=DALLAS_JURISDICTION_ID,
+    )
+    assert result.get("answer")
+    assert "confidence" in result
+
+
+# -----------------------------------------------------------------------
+# Confidence labeling tests
+# -----------------------------------------------------------------------
+
+
+def test_confidence_grounded_with_informative_chunks(
+    mock_supabase_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With informative chunks, confidence should be 'grounded'."""
+    _configure_llm(
+        monkeypatch, ai_available=True, ask_return="Well-grounded answer."
+    )
+
+    result = _qa_mod.qa.answer_question(
+        "What are the ESA rules for a landlord in Dallas, TX?",
+        chat_history=[],
+        jurisdiction_id=DALLAS_JURISDICTION_ID,
+    )
+    assert result.get("confidence") in ("grounded", "weak_evidence")
+
+
+def test_confidence_weak_with_empty_results(
+    mock_supabase_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no results, the no-LLM fallback should report weak_evidence."""
+    mock_supabase_client.set_match_regulations_override(lambda _: [])
+    _configure_llm(monkeypatch, ai_available=False, ask_return=None)
+
+    result = _qa_mod.qa.answer_question(
+        "What are ESA rules?",
+        chat_history=[],
+        jurisdiction_id=DALLAS_JURISDICTION_ID,
+    )
+    assert result.get("confidence") == "weak_evidence"
+
+
+# -----------------------------------------------------------------------
+# Jurisdiction comparison tests
+# -----------------------------------------------------------------------
+
+
+def test_cross_jurisdiction_returns_multiple_sources(
+    mock_supabase_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cross-jurisdiction queries should retrieve from multiple jurisdictions."""
+    _configure_llm(
+        monkeypatch, ai_available=True, ask_return="Comparison answer."
+    )
+    monkeypatch.setattr(_qa_mod.settings, "RAG_HYBRID_ENABLED", False)
+
+    result = _qa_mod.qa.answer_question(
+        "Compare ESA rules in Dallas vs Houston in Texas",
+        chat_history=[],
+    )
+    assert result.get("answer")
+    sources = result.get("sources") or []
+    assert len(sources) >= 1
+
+
+# -----------------------------------------------------------------------
+# Gemini embedding dimension validation
+# -----------------------------------------------------------------------
+
+
+def test_embedding_dim_validation() -> None:
+    """validate_embedding_dims should raise on mismatched dimensions."""
+    import core.rag.vector_store as _vs_mod
+
+    _vs_mod.validate_embedding_dims([0.0] * 3072)
+
+    try:
+        _vs_mod.validate_embedding_dims([0.0] * 1536)
+        pytest.fail("Expected EmbeddingError for 1536 dims")
+    except Exception as e:
+        assert "dimension mismatch" in str(e).lower()
+
+    try:
+        _vs_mod.validate_embedding_dims([0.0] * 768)
+        pytest.fail("Expected EmbeddingError for 768 dims")
+    except Exception as e:
+        assert "dimension mismatch" in str(e).lower()

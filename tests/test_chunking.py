@@ -117,6 +117,40 @@ class TestLegalChunking:
         assert all(t == len(result) for t in totals)
 
 
+class TestChunkMetaSerialization:
+    def test_to_dict_basic(self) -> None:
+        meta = ChunkMeta(
+            section_title="§ 42.1 Fair Housing",
+            chunk_index=0,
+            total_chunks=3,
+            has_definitions=True,
+            has_effective_date=False,
+            citation_hint="§ 42.1",
+        )
+        d = meta.to_dict()
+        assert d["section_title"] == "§ 42.1 Fair Housing"
+        assert d["citation_hint"] == "§ 42.1"
+        assert d["has_definitions"] is True
+
+    def test_source_metadata_propagated(self) -> None:
+        result = chunk_legal_text(
+            "Section 1.0 Overview\nSome content about housing.",
+            chunk_size=2000,
+            source_metadata={"source_name": "HUD", "jurisdiction_id": 42},
+        )
+        assert len(result) >= 1
+        _, meta = result[0]
+        assert meta.extra.get("source_name") == "HUD"
+        assert meta.extra.get("jurisdiction_id") == 42
+
+    def test_citation_hint_extracted(self) -> None:
+        text = "Under § 3604 of the Fair Housing Act, discrimination is prohibited."
+        result = chunk_legal_text(text, chunk_size=2000)
+        assert len(result) >= 1
+        _, meta = result[0]
+        assert "3604" in meta.citation_hint
+
+
 class TestRerankerScoring:
     """Basic smoke tests for the deterministic reranker."""
 
@@ -147,3 +181,55 @@ class TestRerankerScoring:
         assert len(reranked) == 2
         assert "rerank_score" in reranked[0]
         assert reranked[0]["rerank_score"] >= reranked[1]["rerank_score"]
+
+    def test_rerank_section_relevance(self) -> None:
+        from core.rag.reranker import rerank_deterministic
+
+        results = [
+            {
+                "document": "Content about pets",
+                "metadata": {
+                    "source_name": "Source A",
+                    "url": "https://example.com/a",
+                    "section_title": "ESA Rules and Regulations",
+                },
+                "score": 0.7,
+            },
+            {
+                "document": "Content about pets",
+                "metadata": {
+                    "source_name": "Source B",
+                    "url": "https://example.com/b",
+                    "section_title": "Parking Requirements",
+                },
+                "score": 0.7,
+            },
+        ]
+        reranked = rerank_deterministic(results, "ESA rules")
+        assert reranked[0]["metadata"]["section_title"] == "ESA Rules and Regulations"
+
+
+class TestGroundingConfidence:
+    """Tests for the grounding module's confidence assessment."""
+
+    def test_empty_results_out_of_scope(self) -> None:
+        from core.rag.grounding import assess_confidence
+        conf, notices = assess_confidence([])
+        assert conf == "out_of_scope"
+
+    def test_informative_chunks_grounded(self) -> None:
+        from core.rag.grounding import assess_confidence
+        results = [
+            {"document": "A" * 300 + " § 3604 Fair Housing Act provision", "metadata": {"url": "https://hud.gov/esa"}},
+            {"document": "B" * 300 + " Section 504 regulation text here", "metadata": {"url": "https://hud.gov/504"}},
+        ]
+        conf, notices = assess_confidence(results)
+        assert conf == "grounded"
+
+    def test_short_chunks_weak(self) -> None:
+        from core.rag.grounding import assess_confidence
+        results = [
+            {"document": "short", "metadata": {}},
+        ]
+        conf, notices = assess_confidence(results)
+        assert conf == "weak_evidence"

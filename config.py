@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     RAG_RERANK_TOP_K: int = 5
     RAG_LLM_RERANK_ENABLED: bool = False
     RAG_USE_LEGAL_CHUNKING: bool = True
+    RAG_CROSS_JURISDICTION_MAX: int = 8
+    RAG_MAX_CHUNKS_PER_SOURCE: int = 2
+    RAG_MIN_INFORMATIVE_CHARS: int = 220
 
     # Source registry: when True the scraper reads from regulation_sources table
     # instead of the CSV file.  Persisted in app_settings; this env var is the
@@ -83,7 +86,7 @@ settings = Settings()
 CHUNK_SIZE: int = 800          # characters per text chunk when indexing
 CHUNK_OVERLAP: int = 200       # overlap between consecutive chunks (sliding window)
 MAX_CONTEXT_CHARS: int = 4000  # max total characters passed to LLM as context (~1000 tokens)
-EMBEDDING_DIMS: int = 1536     # vector dimensions (matches regulation_embeddings table)
+EMBEDDING_DIMS: int = 3072     # Gemini embedding-001 outputs 3072-dim vectors
 
 # Canonical, stable import path used across the app.
 LEGAL_DISCLAIMER: str = settings.LEGAL_DISCLAIMER

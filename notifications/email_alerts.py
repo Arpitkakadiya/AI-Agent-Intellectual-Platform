@@ -124,19 +124,28 @@ Intelligence Platform
         jurisdiction_id = int(jurisdiction_id)
         jurisdiction_name = self._get_jurisdiction_name(db, jurisdiction_id)
 
-        db.table("email_subscriptions").upsert(
-            [
-                {
-                    "email": email,
-                    "jurisdiction_id": jurisdiction_id,
-                    "is_active": True,
-                }
-            ],
-            on_conflict="email,jurisdiction_id",
-            ignore_duplicates=True,
-        ).execute()
+        try:
+            db.table("email_subscriptions").upsert(
+                [
+                    {
+                        "email": email,
+                        "jurisdiction_id": jurisdiction_id,
+                        "is_active": True,
+                    }
+                ],
+                on_conflict="email,jurisdiction_id",
+                ignore_duplicates=True,
+            ).execute()
+        except Exception as exc:
+            msg = str(exc)
+            if "permission denied" in msg.lower() or "42501" in msg:
+                raise PermissionError(
+                    "Database permission denied for email_subscriptions. "
+                    "Run the RLS policy SQL from LOCAL_DEVELOPMENT.md step 6, "
+                    "or switch SUPABASE_KEY to the service_role key."
+                ) from exc
+            raise
 
-        # Best-effort welcome email.
         try:
             self.send_welcome_email(email=email, jurisdiction_name=jurisdiction_name)
         except Exception:
@@ -146,20 +155,40 @@ Intelligence Platform
 
     def unsubscribe(self, email: str, jurisdiction_id: int) -> dict[str, Any]:
         db = get_db()
-        db.table("email_subscriptions").update({"is_active": False}).eq(
-            "email", email
-        ).eq("jurisdiction_id", int(jurisdiction_id)).execute()
+        try:
+            db.table("email_subscriptions").update({"is_active": False}).eq(
+                "email", email
+            ).eq("jurisdiction_id", int(jurisdiction_id)).execute()
+        except Exception as exc:
+            msg = str(exc)
+            if "permission denied" in msg.lower() or "42501" in msg:
+                raise PermissionError(
+                    "Database permission denied for email_subscriptions. "
+                    "Run the RLS policy SQL from LOCAL_DEVELOPMENT.md step 6, "
+                    "or switch SUPABASE_KEY to the service_role key."
+                ) from exc
+            raise
         return {"status": "unsubscribed"}
 
     def get_active_subscriptions(self, email: str) -> list[dict[str, Any]]:
         db = get_db()
-        res = (
-            db.table("email_subscriptions")
-            .select("jurisdiction_id,is_active,subscribed_at")
-            .eq("email", email)
-            .eq("is_active", True)
-            .execute()
-        )
+        try:
+            res = (
+                db.table("email_subscriptions")
+                .select("jurisdiction_id,is_active,subscribed_at")
+                .eq("email", email)
+                .eq("is_active", True)
+                .execute()
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if "permission denied" in msg.lower() or "42501" in msg:
+                raise PermissionError(
+                    "Database permission denied for email_subscriptions. "
+                    "Run the RLS policy SQL from LOCAL_DEVELOPMENT.md step 6, "
+                    "or switch SUPABASE_KEY to the service_role key."
+                ) from exc
+            raise
         subs = res.data or []
         jurisdiction_ids = [int(r["jurisdiction_id"]) for r in subs]
         if not jurisdiction_ids:

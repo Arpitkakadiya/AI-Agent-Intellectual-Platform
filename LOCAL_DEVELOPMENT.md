@@ -30,6 +30,9 @@ In the Supabase Dashboard:
    - `db/migrations/005_match_regulations_v2.sql`
    - `db/migrations/006_hybrid_retrieval.sql`
    - `db/migrations/007_regulation_sources.sql` — adds `regulation_sources` + `app_settings` tables
+   - `db/migrations/008_chunk_metadata.sql`
+   - `db/migrations/009_email_subscriptions_rls.sql` — RLS for `email_subscriptions`
+   - `db/migrations/010_pet_insurance_rls.sql` — RLS for `pet_policies` + `insurance_requirements`
 3. Ensure the `vector` extension is enabled (it is created by the migration script).
 
 ## 4) Create your environment file
@@ -105,6 +108,12 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.email_subscriptions TO anon
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.regulation_sources TO anon, authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.app_settings TO anon, authenticated;
 
+-- Structured policy tables (pet_policies + insurance_requirements from 001, RLS from 010)
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.pet_policies TO anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.insurance_requirements TO anon, authenticated;
+GRANT USAGE, SELECT ON SEQUENCE public.pet_policies_id_seq TO anon, authenticated;
+GRANT USAGE, SELECT ON SEQUENCE public.insurance_requirements_id_seq TO anon, authenticated;
+
 -- Policy helpers (if RLS is enabled). These are permissive for dev.
 DROP POLICY IF EXISTS "anon_rw_jurisdictions" ON public.jurisdictions;
 CREATE POLICY "anon_rw_jurisdictions"
@@ -157,6 +166,24 @@ WITH CHECK (true);
 DROP POLICY IF EXISTS "anon_rw_app_settings" ON public.app_settings;
 CREATE POLICY "anon_rw_app_settings"
 ON public.app_settings
+FOR ALL
+TO anon
+USING (true)
+WITH CHECK (true);
+
+ALTER TABLE public.pet_policies ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_rw_pet_policies" ON public.pet_policies;
+CREATE POLICY "anon_rw_pet_policies"
+ON public.pet_policies
+FOR ALL
+TO anon
+USING (true)
+WITH CHECK (true);
+
+ALTER TABLE public.insurance_requirements ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "anon_rw_insurance_requirements" ON public.insurance_requirements;
+CREATE POLICY "anon_rw_insurance_requirements"
+ON public.insurance_requirements
 FOR ALL
 TO anon
 USING (true)

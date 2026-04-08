@@ -77,6 +77,8 @@ def vector_search(
         deduped.append(
             {"document": h.document, "metadata": h.metadata, "score": h.score}
         )
+
+    logger.debug("Vector search returned %d results (deduped from %d)", len(deduped), len(all_hits))
     return deduped
 
 
@@ -129,6 +131,7 @@ def keyword_search(
         }
         res = db.rpc("match_regulations_lexical", payload).execute()
         rows = res.data or []
+        logger.debug("Lexical RPC returned %d results", len(rows))
         return [
             {
                 "document": r.get("chunk_text") or "",
@@ -210,6 +213,7 @@ def _python_keyword_fallback(
         )
 
     scored.sort(key=lambda x: x["score"], reverse=True)
+    logger.debug("Python keyword fallback returned %d results", min(n_results, len(scored)))
     return scored[:n_results]
 
 
@@ -243,6 +247,11 @@ def hybrid_search(
     )
     kw_results = keyword_search(query, fetch_n, jurisdiction_ids, category_filter)
 
+    logger.debug(
+        "Hybrid fusion: %d vector + %d keyword candidates (vw=%.2f, kw=%.2f)",
+        len(vec_results), len(kw_results), vw, kw,
+    )
+
     scores: dict[str, float] = {}
     docs: dict[str, dict[str, Any]] = {}
 
@@ -267,5 +276,8 @@ def hybrid_search(
     for fp, score in ranked[:n_results]:
         entry = dict(docs[fp])
         entry["hybrid_score"] = score
+        entry["score"] = score
         out.append(entry)
+
+    logger.debug("Hybrid search returning %d fused results", len(out))
     return out

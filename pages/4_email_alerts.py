@@ -52,9 +52,19 @@ def show_page() -> None:
                 elif sub_state_id is None:
                     st.error("Please select a state.")
                 else:
-                    with st.spinner("Subscribing..."):
-                        email_alerts.subscribe(email=sub_email.strip(), jurisdiction_id=sub_state_id)
-                    st.success("Subscription saved (welcome email sent if SMTP is configured).")
+                    try:
+                        with st.spinner("Subscribing..."):
+                            email_alerts.subscribe(email=sub_email.strip(), jurisdiction_id=sub_state_id)
+                        st.success("Subscription saved (welcome email sent if SMTP is configured).")
+                    except PermissionError as exc:
+                        st.error(
+                            "⚠️ **Database permission error.** The Supabase `anon` role cannot write to "
+                            "`email_subscriptions`. Fix options:\n\n"
+                            "1. Run the RLS policy SQL from **LOCAL_DEVELOPMENT.md § Step 6** in the Supabase SQL Editor.\n"
+                            "2. Or set `SUPABASE_KEY` to the **service_role** key in `.env`."
+                        )
+                    except Exception as exc:
+                        st.error(f"Subscription failed: {exc}")
 
     with col_unsub:
         with st.container(border=True):
@@ -83,11 +93,19 @@ def show_page() -> None:
                 elif unsub_state_id is None:
                     st.error("Please select a state.")
                 else:
-                    with st.spinner("Unsubscribing..."):
-                        email_alerts.unsubscribe(
-                            email=unsub_email.strip(), jurisdiction_id=unsub_state_id
+                    try:
+                        with st.spinner("Unsubscribing..."):
+                            email_alerts.unsubscribe(
+                                email=unsub_email.strip(), jurisdiction_id=unsub_state_id
+                            )
+                        st.success("You have been unsubscribed.")
+                    except PermissionError:
+                        st.error(
+                            "⚠️ **Database permission error.** See LOCAL_DEVELOPMENT.md § Step 6 "
+                            "or switch to the service_role key."
                         )
-                    st.success("You have been unsubscribed.")
+                    except Exception as exc:
+                        st.error(f"Unsubscribe failed: {exc}")
 
     st.write("")
     with st.container(border=True):
@@ -102,13 +120,21 @@ def show_page() -> None:
             if not view_email.strip():
                 st.error("Please enter an email.")
             else:
-                with st.spinner("Looking up subscriptions..."):
-                    subs = email_alerts.get_active_subscriptions(email=view_email.strip())
-                if not subs:
-                    st.info("No active subscriptions found for this email.")
-                else:
-                    for s in subs:
-                        st.write(f"- {s['jurisdiction_name']}")
+                try:
+                    with st.spinner("Looking up subscriptions..."):
+                        subs = email_alerts.get_active_subscriptions(email=view_email.strip())
+                    if not subs:
+                        st.info("No active subscriptions found for this email.")
+                    else:
+                        for s in subs:
+                            st.write(f"- {s['jurisdiction_name']}")
+                except PermissionError:
+                    st.error(
+                        "⚠️ **Database permission error.** See LOCAL_DEVELOPMENT.md § Step 6 "
+                        "or switch to the service_role key."
+                    )
+                except Exception as exc:
+                    st.error(f"Lookup failed: {exc}")
 
 
 show_page()

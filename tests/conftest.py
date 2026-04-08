@@ -230,12 +230,27 @@ def mock_supabase_client(monkeypatch: pytest.MonkeyPatch) -> FakeSupabaseClient:
         import config as _cfg
         monkeypatch.setattr(_cfg.settings, "RAG_HYBRID_ENABLED", False)
         monkeypatch.setattr(_cfg.settings, "RAG_RETRIEVAL_TOP_N", 5)
+        monkeypatch.setattr(_cfg.settings, "RAG_RERANK_TOP_K", 5)
+        monkeypatch.setattr(_cfg.settings, "RAG_CROSS_JURISDICTION_MAX", 8)
+        monkeypatch.setattr(_cfg.settings, "RAG_MAX_CHUNKS_PER_SOURCE", 2)
+        monkeypatch.setattr(_cfg.settings, "RAG_MIN_INFORMATIVE_CHARS", 220)
     except (ImportError, AttributeError):
         pass
 
     try:
         monkeypatch.setattr(_qa_mod.settings, "RAG_HYBRID_ENABLED", False)
         monkeypatch.setattr(_qa_mod.settings, "RAG_RETRIEVAL_TOP_N", 5)
+        monkeypatch.setattr(_qa_mod.settings, "RAG_RERANK_TOP_K", 5)
+        monkeypatch.setattr(_qa_mod.settings, "RAG_CROSS_JURISDICTION_MAX", 8)
+        monkeypatch.setattr(_qa_mod.settings, "RAG_MAX_CHUNKS_PER_SOURCE", 2)
+        monkeypatch.setattr(_qa_mod.settings, "RAG_MIN_INFORMATIVE_CHARS", 220)
+    except (ImportError, AttributeError):
+        pass
+
+    # Disable embedding dim validation in tests (fake embeddings are short).
+    try:
+        import core.rag.vector_store as _vs
+        monkeypatch.setattr(_vs, "validate_embedding_dims", lambda *a, **kw: None)
     except (ImportError, AttributeError):
         pass
 

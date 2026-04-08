@@ -14,10 +14,13 @@ Key behaviours:
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 from db.client import get_db
+
+logger = logging.getLogger(__name__)
 
 _HIERARCHY_ORDER = {"federal": 0, "state": 1, "county": 2, "city": 3}
 
@@ -140,6 +143,7 @@ def build_retrieval_plan(
     labelled ``cross_jurisdiction``, plus federal.
     """
     if is_cross_jurisdiction:
+        logger.debug("Building cross-jurisdiction retrieval plan for %d mentioned IDs", len(mentioned_jurisdiction_ids))
         db = get_db()
         plan: list[ScopedJurisdiction] = []
         seen: set[int] = set()
@@ -186,13 +190,16 @@ def build_retrieval_plan(
                 )
             )
 
+        logger.debug("Cross-jurisdiction plan: %s", [sj.scope_label for sj in plan])
         return plan
 
     primary_jid = sidebar_jurisdiction_id
     if not primary_jid and mentioned_jurisdiction_ids:
         primary_jid = mentioned_jurisdiction_ids[0]
 
-    return resolve_hierarchy(primary_jid, include_parents=True, include_federal=True)
+    plan_result = resolve_hierarchy(primary_jid, include_parents=True, include_federal=True)
+    logger.debug("Single-jurisdiction plan: %s", [sj.scope_label for sj in plan_result])
+    return plan_result
 
 
 def detect_jurisdiction_conflicts(

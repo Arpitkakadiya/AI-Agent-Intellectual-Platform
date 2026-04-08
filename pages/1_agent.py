@@ -12,10 +12,11 @@ from db.client import get_db
 from db.models import Jurisdiction
 from ui_theme import apply_theme, page_header
 
-COMPLIANCE_KEYWORDS = ("compliant", "compliance", "check")
+COMPLIANCE_KEYWORDS = ("compliant", "compliance", "check", "review my", "analyze my")
 FILE_BYTES_KEY = "uploaded_file_bytes"
 FILE_NAME_KEY = "uploaded_file_name"
 FILE_SIZE_KEY = "uploaded_file_size"
+COMPLIANCE_DONE_KEY = "compliance_review_done"
 CHAT_KEY = "chat_history"
 JURISDICTION_KEY = "jurisdiction_id"
 SELECTED_STATE_KEY = "selected_state_id"
@@ -36,7 +37,7 @@ def _init_state() -> None:
 
 def _clear_chat() -> None:
     st.session_state[CHAT_KEY] = []
-    for key in (FILE_BYTES_KEY, FILE_NAME_KEY, FILE_SIZE_KEY, PENDING_PROMPT_KEY):
+    for key in (FILE_BYTES_KEY, FILE_NAME_KEY, FILE_SIZE_KEY, PENDING_PROMPT_KEY, COMPLIANCE_DONE_KEY):
         if key in st.session_state:
             del st.session_state[key]
 
@@ -137,6 +138,16 @@ def _show_agent_sidebar_extras() -> None:
 
         if uploaded is not None:
             file_bytes = uploaded.getvalue()
+            old_name = st.session_state.get(FILE_NAME_KEY)
+            if old_name and uploaded.name != old_name:
+                st.session_state[CHAT_KEY].append(
+                    {
+                        "role": "assistant",
+                        "content": f"📄 Document changed from **{old_name}** to **{uploaded.name}**. "
+                        "Future questions will reference the new document.",
+                        "sources": [],
+                    }
+                )
             st.session_state[FILE_BYTES_KEY] = file_bytes
             st.session_state[FILE_NAME_KEY] = uploaded.name
             st.session_state[FILE_SIZE_KEY] = uploaded.size
@@ -222,6 +233,12 @@ def _render_sources(sources: list[dict[str, Any]]) -> None:
                 st.markdown(f"- {source_name}")
 
 
+def _should_run_compliance_review(prompt: str) -> bool:
+    """Only run compliance review when the user explicitly asks for it."""
+    prompt_lc = prompt.lower()
+    return any(k in prompt_lc for k in COMPLIANCE_KEYWORDS)
+
+
 def _handle_message(prompt: str, active_file: Optional[dict[str, Any]]) -> None:
     jurisdiction_id = st.session_state.get(JURISDICTION_KEY)
     if jurisdiction_id is None:
@@ -229,8 +246,7 @@ def _handle_message(prompt: str, active_file: Optional[dict[str, Any]]) -> None:
         return
 
     file_present = active_file is not None
-    prompt_lc = prompt.lower()
-    should_run_compliance = file_present or any(k in prompt_lc for k in COMPLIANCE_KEYWORDS)
+    run_compliance = _should_run_compliance_review(prompt)
 
     st.session_state[CHAT_KEY].append(
         {
@@ -248,7 +264,7 @@ def _handle_message(prompt: str, active_file: Optional[dict[str, Any]]) -> None:
     sources: list[dict[str, Any]] = []
 
     with st.chat_message("assistant"):
-        if should_run_compliance:
+        if run_compliance:
             if not file_present:
                 answer = (
                     "I can run a compliance check, but I need a lease document first. "
@@ -264,8 +280,23 @@ def _handle_message(prompt: str, active_file: Optional[dict[str, Any]]) -> None:
                         )
                         answer = _format_compliance_markdown(result)
                         sources = list(result.sources)
+                        sources.insert(0, {"source": active_file["name"], "url": ""})
+                        st.session_state[COMPLIANCE_DONE_KEY] = True
                     except Exception as exc:  # noqa: BLE001
                         answer = f"Compliance check failed: {exc}"
+        elif file_present:
+            with st.spinner("Analyzing document..."):
+                try:
+                    qa_result = checker.document_qa(
+                        question=prompt,
+                        file_bytes=active_file["bytes"],
+                        filename=active_file["name"],
+                        chat_history=st.session_state[CHAT_KEY],
+                    )
+                    answer = str(qa_result.get("answer") or "")
+                    sources = list(qa_result.get("sources") or [])
+                except Exception as exc:  # noqa: BLE001
+                    answer = f"Unable to answer about the document: {exc}"
         else:
             with st.spinner("Thinking..."):
                 try:
@@ -352,7 +383,7 @@ def show_agent_page() -> None:
 
     placeholder = "Ask about housing regulations..."
     if active_file is not None:
-        placeholder = f"Ask compliance question for {active_file['name']}..."
+        placeholder = f"Ask a question about {active_file['name']}..."
 
     prompt = st.chat_input(placeholder=placeholder)
     if prompt:
