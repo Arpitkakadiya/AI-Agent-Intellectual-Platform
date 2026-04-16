@@ -73,41 +73,30 @@ def show_page() -> None:
     apply_theme()
 
     stats = _get_stats()
-    states_covered = stats["total_states"] or "50+"
-    regs_count = f'{stats["total_regs"]:,}' if stats["total_regs"] else "1,000+"
-
     # ── Hero Banner with building background ──
     st.markdown(
-        f'<div class="rc-landing-hero">'
-        f'<div class="rc-landing-hero-content">'
-        f'<div class="rc-landing-hero-eyebrow">AI-Powered Compliance Intelligence</div>'
-        f'<div class="rc-landing-hero-title">MULTI-FAMILY HOUSING</div>'
-        f'<div class="rc-landing-hero-subtitle">'
-        f'The all-in-one platform for multi-family housing regulation compliance. '
-        f'Search regulations, review lease documents against state and local laws, '
-        f'track regulatory changes, and get AI-powered answers to complex compliance '
-        f'questions — so you can manage properties with confidence.'
-        f'</div>'
-        f'<div class="rc-landing-hero-stats">'
-        f'<div class="rc-landing-stat">'
-        f'<span class="rc-landing-stat-value">{states_covered}</span>'
-        f'<span class="rc-landing-stat-label">States Covered</span>'
-        f'</div>'
-        f'<div class="rc-landing-stat">'
-        f'<span class="rc-landing-stat-value">{regs_count}</span>'
-        f'<span class="rc-landing-stat-label">Regulations Indexed</span>'
-        f'</div>'
-        f'<div class="rc-landing-stat">'
-        f'<span class="rc-landing-stat-value">{stats["total_indexed"]:,}</span>'
-        f'<span class="rc-landing-stat-label">Documents Processed</span>'
-        f'</div>'
-        f'<div class="rc-landing-stat">'
-        f'<span class="rc-landing-stat-value">24/7</span>'
-        f'<span class="rc-landing-stat-label">AI Availability</span>'
-        f'</div>'
-        f'</div>'
-        f'</div>'
-        f'</div>',
+        '<div class="rc-landing-hero">'
+        '<div class="rc-landing-hero-content">'
+        '<div class="rc-landing-hero-eyebrow">AI-Powered Compliance Intelligence</div>'
+        '<div class="rc-landing-hero-title">MULTI-FAMILY HOUSING</div>'
+        '<div class="rc-landing-hero-subtitle">'
+        'The all-in-one platform for multi-family housing regulation compliance. '
+        'Search regulations, review lease documents against state and local laws, '
+        'track regulatory changes, and get AI-powered answers to complex compliance '
+        'questions — so you can manage properties with confidence.'
+        '</div>'
+        '<div class="rc-landing-hero-stats">'
+        '<div class="rc-landing-stat">'
+        '<span class="rc-landing-stat-value">5</span>'
+        '<span class="rc-landing-stat-label">States Covered</span>'
+        '</div>'
+        '<div class="rc-landing-stat">'
+        '<span class="rc-landing-stat-value">24/7</span>'
+        '<span class="rc-landing-stat-label">AI Availability</span>'
+        '</div>'
+        '</div>'
+        '</div>'
+        '</div>',
         unsafe_allow_html=True,
     )
 
