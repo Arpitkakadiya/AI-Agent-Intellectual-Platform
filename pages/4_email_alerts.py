@@ -54,8 +54,13 @@ def show_page() -> None:
                 else:
                     try:
                         with st.spinner("Subscribing..."):
-                            email_alerts.subscribe(email=sub_email.strip(), jurisdiction_id=sub_state_id)
-                        st.success("Subscription saved (welcome email sent if SMTP is configured).")
+                            email_alerts.subscribe(
+                                email=sub_email.strip(), jurisdiction_id=sub_state_id
+                            )
+                        st.success(
+                            "Subscription saved. If this was a new or reactivated subscription, "
+                            "a welcome email is sent when SMTP is configured (or saved under `emails/`)."
+                        )
                     except PermissionError as exc:
                         st.error(
                             "⚠️ **Database permission error.** The Supabase `anon` role cannot write to "
@@ -95,10 +100,19 @@ def show_page() -> None:
                 else:
                     try:
                         with st.spinner("Unsubscribing..."):
-                            email_alerts.unsubscribe(
-                                email=unsub_email.strip(), jurisdiction_id=unsub_state_id
+                            out = email_alerts.unsubscribe(
+                                email=unsub_email.strip(),
+                                jurisdiction_id=unsub_state_id,
                             )
-                        st.success("You have been unsubscribed.")
+                        if out.get("status") == "not_found":
+                            st.warning(
+                                "No active subscription was found for that email and state."
+                            )
+                        else:
+                            st.success(
+                                "You have been unsubscribed. A confirmation email is sent when "
+                                "SMTP is configured (or saved under `emails/`)."
+                            )
                     except PermissionError:
                         st.error(
                             "⚠️ **Database permission error.** See LOCAL_DEVELOPMENT.md § Step 6 "

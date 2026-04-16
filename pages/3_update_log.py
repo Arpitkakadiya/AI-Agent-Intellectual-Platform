@@ -26,6 +26,17 @@ def show_page() -> None:
     apply_theme()
     page_header("Update Log", "Monitor regulatory changes and newly detected updates")
 
+    last_scan_count = st.session_state.pop("update_log_last_scan_count", None)
+    if last_scan_count is not None:
+        if last_scan_count == 0:
+            st.success("Scan complete. No new regulatory changes detected.")
+        else:
+            st.success(f"Scan complete. {last_scan_count} update(s) recorded.")
+
+    scan_err = st.session_state.pop("update_log_scan_error", None)
+    if scan_err:
+        st.error(scan_err)
+
     state_options = get_state_jurisdiction_options()
     state_names = ["All States"] + [s["name"] for s in state_options]
 
@@ -45,17 +56,32 @@ def show_page() -> None:
 
     if st.button("🔄 Check for updates", type="primary"):
         with st.spinner("Scanning for regulatory changes..."):
-            updates = update_checker.check_for_updates()
-            st.session_state["latest_updates"] = updates
+            try:
+                updates = update_checker.check_for_updates(send_alerts=True)
+                st.session_state["update_log_last_scan_count"] = len(updates)
+            except Exception as exc:
+                raw = exc.args[0] if exc.args else None
+                if isinstance(raw, dict):
+                    msg = str(raw.get("message") or raw)
+                else:
+                    msg = str(raw if raw is not None else exc)
+                low = msg.lower()
+                if "permission denied" in low or "42501" in msg:
+                    st.session_state["update_log_scan_error"] = (
+                        "Cannot write to `regulation_updates` (permission denied). "
+                        "Run `db/migrations/011_regulation_updates_rls.sql` in the Supabase SQL Editor, then retry."
+                    )
+                else:
+                    st.session_state["update_log_scan_error"] = f"Scan failed: {msg}"
         st.rerun()
 
-    updates: list[Any] = st.session_state.get("latest_updates") or []
-    if not updates:
-        st.info("No updates found. Click **Check for updates** to scan for changes.")
-        return
+    raw_updates, fetch_err = update_checker.fetch_update_log_from_db(limit=400)
+    if fetch_err:
+        st.error(fetch_err)
+    has_any_in_db = len(raw_updates) > 0
 
-    filtered = []
-    for u in updates:
+    filtered: list[Any] = []
+    for u in raw_updates:
         affected = getattr(u, "affected_jurisdiction_ids", []) or []
         if selected_state_id is None or int(selected_state_id) in [int(x) for x in affected]:
             filtered.append(u)
@@ -72,6 +98,22 @@ def show_page() -> None:
         deduped.append(u)
 
     deduped = deduped[:count]
+
+    if not deduped:
+        if last_scan_count is not None and last_scan_count == 0 and not has_any_in_db:
+            return
+        if fetch_err:
+            return
+        if has_any_in_db and selected_state_id is not None:
+            st.info("No updates match the selected state filter.")
+        elif not has_any_in_db:
+            st.info(
+                "No updates recorded yet. Click **Check for updates** to scan, "
+                "or run the scheduled scraper."
+            )
+        else:
+            st.info("No updates to display. Try increasing how many updates to show.")
+        return
 
     all_affected_ids: set[int] = set()
     for u in deduped:
@@ -112,9 +154,10 @@ def show_page() -> None:
                 f" &nbsp; 📅 {date_str}",
                 unsafe_allow_html=True,
             )
-            if update_summary:
+            if update_summary or url:
                 with st.expander("Details"):
-                    st.write(update_summary)
+                    if update_summary:
+                        st.write(update_summary)
                     if url:
                         st.markdown(f"[View source ↗]({url})")
 
