@@ -57,7 +57,7 @@ def show_page() -> None:
     if st.button("🔄 Check for updates", type="primary"):
         with st.spinner("Scanning for regulatory changes..."):
             try:
-                updates = update_checker.check_for_updates()
+                updates = update_checker.check_for_updates(send_alerts=True)
                 st.session_state["update_log_last_scan_count"] = len(updates)
             except Exception as exc:
                 raw = exc.args[0] if exc.args else None

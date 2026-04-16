@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime
 from typing import Any, Callable, Optional
 
@@ -11,10 +12,11 @@ import requests
 import urllib3
 from pydantic import BaseModel
 
-from config import settings
 from core.llm.client import llm
 from core.llm.prompts import UPDATE_SUMMARY_PROMPT
 from db.client import get_db
+
+logger = logging.getLogger(__name__)
 
 _HTTP_HEADERS: dict[str, str] = {
     "User-Agent": (
@@ -224,6 +226,32 @@ class UpdateChecker:
             ]
         ).execute()
 
+        try:
+            from core.rag.vector_store import RegulationVectorStore
+
+            RegulationVectorStore().add_documents(
+                [
+                    {
+                        "text": str(new_content),
+                        "regulation_id": int(new_regulation_id),
+                        "metadata": {
+                            "source_name": str(payload["source_name"]),
+                            "url": url,
+                            "domain": str(payload["domain"]),
+                            "category": str(payload["category"]),
+                            "jurisdiction_id": int(payload["jurisdiction_id"]),
+                        },
+                    }
+                ]
+            )
+        except Exception:
+            logger.warning(
+                "Failed to re-embed regulation %s after manual update check; "
+                "re-run indexing from Settings if Explorer is stale.",
+                new_regulation_id,
+                exc_info=True,
+            )
+
         return UpdateResult(
             source_name=str(reg.get("source_name") or payload["source_name"]),
             url=url,
@@ -233,7 +261,7 @@ class UpdateChecker:
             detected_at=detected_at,
         )
 
-    def check_for_updates(self) -> list[UpdateResult]:
+    def check_for_updates(self, *, send_alerts: bool = False) -> list[UpdateResult]:
         db = self._db_getter()
 
         regs_res = (
@@ -252,6 +280,19 @@ class UpdateChecker:
                 result = self.check_single(int(row["id"]))
                 if result is not None:
                     out.append(result)
+                    if send_alerts:
+                        try:
+                            from notifications.email_alerts import (
+                                email_alerts as _email_alerts,
+                            )
+
+                            _email_alerts.notify_subscribers(result)
+                        except Exception:
+                            logger.warning(
+                                "notify_subscribers failed for %s",
+                                result.source_name,
+                                exc_info=True,
+                            )
             except Exception:
                 # Continue checking other regulations.
                 continue
