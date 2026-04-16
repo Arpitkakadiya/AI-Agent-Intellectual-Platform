@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 from PyPDF2 import PdfReader
 
 from core.rag.vector_store import RegulationVectorStore
+from core.regulations.update_checker import update_checker
 from db.client import get_db
 from db.models import Regulation
 
@@ -654,7 +655,7 @@ class RegulationScraper:
             # Find the current regulation row for this URL to detect content changes.
             existing = (
                 db.table("regulations")
-                .select("id,content_hash,version")
+                .select("id,content_hash,version,content")
                 .eq("url", url)
                 .eq("is_current", True)
                 .limit(1)
@@ -704,6 +705,14 @@ class RegulationScraper:
                     new_id = int(lookup.data[0]["id"])
 
             if new_id is not None:
+                if old_id is not None:
+                    update_checker.record_regulation_update(
+                        db=db,
+                        new_regulation_id=new_id,
+                        jurisdiction_id=int(reg.jurisdiction_id),
+                        old_content=str(existing_row.get("content") or ""),
+                        new_content=str(reg.content or ""),
+                    )
                 new_docs.append(
                     {
                         "text": reg.content,

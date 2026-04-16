@@ -10,6 +10,7 @@ from core.regulations.update_checker import update_checker
 from db.client import get_db
 from ui_theme import apply_theme, cross_page_link, log_activity, page_hero, section_heading
 
+
 CATEGORY_BADGE = {
     "rent control": "rc-badge-teal",
     "fair housing": "rc-badge-blue",
@@ -26,6 +27,17 @@ def _badge_cls(category: str) -> str:
 def show_page() -> None:
     apply_theme()
     page_hero("📄", "Update Log", "Monitor regulatory changes across jurisdictions — scan for new laws, amendments, and policy updates.", "green")
+
+    last_scan_count = st.session_state.pop("update_log_last_scan_count", None)
+    if last_scan_count is not None:
+        if last_scan_count == 0:
+            st.success("Scan complete. No new regulatory changes detected.")
+        else:
+            st.success(f"Scan complete. {last_scan_count} update(s) recorded.")
+
+    scan_err = st.session_state.pop("update_log_scan_error", None)
+    if scan_err:
+        st.error(scan_err)
 
     state_options = get_state_jurisdiction_options()
     state_names = ["All States"] + [s["name"] for s in state_options]
@@ -48,35 +60,33 @@ def show_page() -> None:
         st.markdown('<div style="height:1.6rem;"></div>', unsafe_allow_html=True)
         if st.button("Check for updates", type="primary", use_container_width=True):
             with st.spinner("Scanning for regulatory changes..."):
-                updates = update_checker.check_for_updates()
-                st.session_state["latest_updates"] = updates
-                st.session_state["last_update_check"] = datetime.now().strftime("%b %d, %Y at %I:%M %p")
-            log_activity("Checked for updates", f"{len(updates)} found")
+                try:
+                    updates = update_checker.check_for_updates(send_alerts=True)
+                    st.session_state["update_log_last_scan_count"] = len(updates)
+                except Exception as exc:
+                    raw = exc.args[0] if exc.args else None
+                    if isinstance(raw, dict):
+                        msg = str(raw.get("message") or raw)
+                    else:
+                        msg = str(raw if raw is not None else exc)
+                    low = msg.lower()
+                    if "permission denied" in low or "42501" in msg:
+                        st.session_state["update_log_scan_error"] = (
+                            "Cannot write to `regulation_updates` (permission denied). "
+                            "Run `db/migrations/011_regulation_updates_rls.sql` in the Supabase SQL Editor, then retry."
+                        )
+                    else:
+                        st.session_state["update_log_scan_error"] = f"Scan failed: {msg}"
+            log_activity("Checked for updates", f"scan complete")
             st.rerun()
 
-    last_check = st.session_state.get("last_update_check")
-    if last_check:
-        st.markdown(
-            f'<div style="font-size:0.78rem;color:var(--rc-text-faint);margin-bottom:0.5rem;">Last checked: {last_check}</div>',
-            unsafe_allow_html=True,
-        )
+    raw_updates, fetch_err = update_checker.fetch_update_log_from_db(limit=400)
+    if fetch_err:
+        st.error(fetch_err)
+    has_any_in_db = len(raw_updates) > 0
 
-    updates: list[Any] = st.session_state.get("latest_updates") or []
-    if not updates:
-        st.markdown(
-            '<div class="rc-empty-state">'
-            '<div class="rc-empty-state-icon">📄</div>'
-            '<div class="rc-empty-state-title">No updates yet</div>'
-            '<div class="rc-empty-state-desc">'
-            'Click <strong>Check for updates</strong> to scan for regulatory changes.'
-            '</div></div>',
-            unsafe_allow_html=True,
-        )
-        cross_page_link("📧", "Get automatic notifications — set up Email Alerts →", "pages/4_email_alerts.py")
-        return
-
-    filtered = []
-    for u in updates:
+    filtered: list[Any] = []
+    for u in raw_updates:
         affected = getattr(u, "affected_jurisdiction_ids", []) or []
         if selected_state_id is None or int(selected_state_id) in [int(x) for x in affected]:
             filtered.append(u)
@@ -93,6 +103,22 @@ def show_page() -> None:
         deduped.append(u)
 
     deduped = deduped[:count]
+
+    if not deduped:
+        if last_scan_count is not None and last_scan_count == 0 and not has_any_in_db:
+            return
+        if fetch_err:
+            return
+        if has_any_in_db and selected_state_id is not None:
+            st.info("No updates match the selected state filter.")
+        elif not has_any_in_db:
+            st.info(
+                "No updates recorded yet. Click **Check for updates** to scan, "
+                "or run the scheduled scraper."
+            )
+        else:
+            st.info("No updates to display. Try increasing how many updates to show.")
+        return
 
     all_affected_ids: set[int] = set()
     for u in deduped:
@@ -139,9 +165,10 @@ def show_page() -> None:
                 f'</div>',
                 unsafe_allow_html=True,
             )
-            if update_summary:
+            if update_summary or url:
                 with st.expander("Details"):
-                    st.write(update_summary)
+                    if update_summary:
+                        st.write(update_summary)
                     if url:
                         st.markdown(f"[View source ↗]({url})")
 

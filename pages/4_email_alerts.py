@@ -67,26 +67,22 @@ def show_page() -> None:
                 else:
                     try:
                         with st.spinner("Subscribing..."):
-                            email_alerts.subscribe(email=sub_email.strip(), jurisdiction_id=sub_state_id)
+                            email_alerts.subscribe(
+                                email=sub_email.strip(), jurisdiction_id=sub_state_id
+                            )
                         st.toast(f"Subscribed to {sub_state_name} alerts", icon="🔔")
                         log_activity("Subscribed to alerts", f"{sub_email.strip()} — {sub_state_name}")
                         st.success(
-                            f"You're subscribed! You'll receive regulatory updates for "
-                            f"**{sub_state_name}** at **{sub_email.strip()}** on business days "
-                            f"when new changes are detected."
+                            "Subscription saved. If this was a new or reactivated subscription, "
+                            "a welcome email is sent when SMTP is configured (or saved under `emails/`)."
                         )
                     except PermissionError:
                         st.error(
-                            "This feature requires additional database setup. "
-                            "Please contact your administrator."
+                            "⚠️ **Database permission error.** The Supabase `anon` role cannot write to "
+                            "`email_subscriptions`. Fix options:\n\n"
+                            "1. Run the RLS policy SQL from **LOCAL_DEVELOPMENT.md § Step 6** in the Supabase SQL Editor.\n"
+                            "2. Or set `SUPABASE_KEY` to the **service_role** key in `.env`."
                         )
-                        with st.expander("Technical details"):
-                            st.code(
-                                "The Supabase anon role cannot write to email_subscriptions.\n"
-                                "Fix: run RLS policy SQL from LOCAL_DEVELOPMENT.md Step 6,\n"
-                                "or set SUPABASE_KEY to the service_role key in .env.",
-                                language="text",
-                            )
                     except Exception:
                         st.error("Subscription could not be saved. Please check your database connection and try again.")
 
@@ -124,12 +120,21 @@ def show_page() -> None:
                 else:
                     try:
                         with st.spinner("Unsubscribing..."):
-                            email_alerts.unsubscribe(
-                                email=unsub_email.strip(), jurisdiction_id=unsub_state_id
+                            out = email_alerts.unsubscribe(
+                                email=unsub_email.strip(),
+                                jurisdiction_id=unsub_state_id,
                             )
-                        st.toast("Unsubscribed successfully", icon="🔕")
-                        log_activity("Unsubscribed from alerts", unsub_email.strip())
-                        st.success("You have been unsubscribed.")
+                        if out.get("status") == "not_found":
+                            st.warning(
+                                "No active subscription was found for that email and state."
+                            )
+                        else:
+                            st.toast("Unsubscribed successfully", icon="🔕")
+                            log_activity("Unsubscribed from alerts", unsub_email.strip())
+                            st.success(
+                                "You have been unsubscribed. A confirmation email is sent when "
+                                "SMTP is configured (or saved under `emails/`)."
+                            )
                     except PermissionError:
                         st.error(
                             "This feature requires additional database setup. "

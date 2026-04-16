@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 from datetime import datetime
 from typing import Any, Callable, Optional
 
@@ -10,10 +12,11 @@ import requests
 import urllib3
 from pydantic import BaseModel
 
-from config import settings
 from core.llm.client import llm
 from core.llm.prompts import UPDATE_SUMMARY_PROMPT
 from db.client import get_db
+
+logger = logging.getLogger(__name__)
 
 _HTTP_HEADERS: dict[str, str] = {
     "User-Agent": (
@@ -50,6 +53,14 @@ class UpdateResult(BaseModel):
     affected_jurisdiction_ids: list[int]
     update_summary: str
     detected_at: datetime
+
+
+def _parse_detected_at(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    raise TypeError(f"Unsupported detected_at type: {type(value)}")
 
 
 class UpdateChecker:
@@ -215,6 +226,32 @@ class UpdateChecker:
             ]
         ).execute()
 
+        try:
+            from core.rag.vector_store import RegulationVectorStore
+
+            RegulationVectorStore().add_documents(
+                [
+                    {
+                        "text": str(new_content),
+                        "regulation_id": int(new_regulation_id),
+                        "metadata": {
+                            "source_name": str(payload["source_name"]),
+                            "url": url,
+                            "domain": str(payload["domain"]),
+                            "category": str(payload["category"]),
+                            "jurisdiction_id": int(payload["jurisdiction_id"]),
+                        },
+                    }
+                ]
+            )
+        except Exception:
+            logger.warning(
+                "Failed to re-embed regulation %s after manual update check; "
+                "re-run indexing from Settings if Explorer is stale.",
+                new_regulation_id,
+                exc_info=True,
+            )
+
         return UpdateResult(
             source_name=str(reg.get("source_name") or payload["source_name"]),
             url=url,
@@ -224,7 +261,7 @@ class UpdateChecker:
             detected_at=detected_at,
         )
 
-    def check_for_updates(self) -> list[UpdateResult]:
+    def check_for_updates(self, *, send_alerts: bool = False) -> list[UpdateResult]:
         db = self._db_getter()
 
         regs_res = (
@@ -243,11 +280,139 @@ class UpdateChecker:
                 result = self.check_single(int(row["id"]))
                 if result is not None:
                     out.append(result)
+                    if send_alerts:
+                        try:
+                            from notifications.email_alerts import (
+                                email_alerts as _email_alerts,
+                            )
+
+                            _email_alerts.notify_subscribers(result)
+                        except Exception:
+                            logger.warning(
+                                "notify_subscribers failed for %s",
+                                result.source_name,
+                                exc_info=True,
+                            )
             except Exception:
                 # Continue checking other regulations.
                 continue
 
         return out
+
+    def record_regulation_update(
+        self,
+        *,
+        db: Any,
+        new_regulation_id: int,
+        jurisdiction_id: int,
+        old_content: str,
+        new_content: str,
+        detected_at: datetime | None = None,
+    ) -> None:
+        """Persist a regulation_updates row after the scraper (or similar) versions a regulation."""
+        detected = detected_at or datetime.utcnow()
+        affected_ids = self._jurisdiction_chain_ids(db, int(jurisdiction_id))
+        update_summary = self._generate_update_summary(
+            old_content=old_content, new_content=new_content
+        )
+        db.table("regulation_updates").insert(
+            [
+                {
+                    "regulation_id": int(new_regulation_id),
+                    "update_summary": update_summary,
+                    "affected_jurisdictions": affected_ids,
+                    "detected_at": detected,
+                }
+            ]
+        ).execute()
+
+    def fetch_update_log_from_db(
+        self, *, limit: int = 400
+    ) -> tuple[list[UpdateResult], Optional[str]]:
+        """Load recorded updates for the Update Log UI (newest first).
+
+        Returns ``(rows, error_message)``. ``error_message`` is set when the query fails
+        (e.g. missing GRANT/RLS on ``regulation_updates`` for the Supabase anon key).
+        """
+        db = self._db_getter()
+        try:
+            upd_res = (
+                db.table("regulation_updates")
+                .select("regulation_id,update_summary,affected_jurisdictions,detected_at")
+                .order("detected_at", desc=True)
+                .limit(int(limit))
+                .execute()
+            )
+            rows = upd_res.data or []
+            if not rows:
+                return [], None
+
+            reg_ids = sorted(
+                {
+                    int(r["regulation_id"])
+                    for r in rows
+                    if r.get("regulation_id") is not None
+                }
+            )
+            reg_map: dict[int, dict[str, Any]] = {}
+            if reg_ids:
+                regs_res = (
+                    db.table("regulations")
+                    .select("id,source_name,url,category")
+                    .in_("id", reg_ids)
+                    .execute()
+                )
+                for r in regs_res.data or []:
+                    reg_map[int(r["id"])] = r
+
+            out: list[UpdateResult] = []
+            for u in rows:
+                rid = u.get("regulation_id")
+                if rid is None:
+                    continue
+                reg = reg_map.get(int(rid))
+                if not reg:
+                    continue
+                raw_aff = u.get("affected_jurisdictions") or []
+                if isinstance(raw_aff, str):
+                    try:
+                        raw_aff = json.loads(raw_aff)
+                    except json.JSONDecodeError:
+                        raw_aff = []
+                affected = [int(x) for x in raw_aff if x is not None]
+                try:
+                    detected_at = _parse_detected_at(u.get("detected_at"))
+                except (TypeError, ValueError):
+                    continue
+                out.append(
+                    UpdateResult(
+                        source_name=str(reg.get("source_name") or "Unknown"),
+                        url=str(reg.get("url") or ""),
+                        category=str(reg.get("category") or ""),
+                        affected_jurisdiction_ids=affected,
+                        update_summary=str(u.get("update_summary") or ""),
+                        detected_at=detected_at,
+                    )
+                )
+            return out, None
+        except Exception as exc:
+            raw: Any = getattr(exc, "message", None)
+            if raw is None and exc.args:
+                raw = exc.args[0]
+            if isinstance(raw, dict):
+                detail = str(raw.get("message") or raw)
+            elif raw is not None:
+                detail = str(raw)
+            else:
+                detail = str(exc)
+            low = detail.lower()
+            if "permission denied" in low or "42501" in detail:
+                return [], (
+                    "Cannot read `regulation_updates` (database permission denied). "
+                    "Open the Supabase SQL Editor, run the script "
+                    "`db/migrations/011_regulation_updates_rls.sql`, then reload this page."
+                )
+            return [], f"Could not load the update log: {detail}"
 
 
 update_checker = UpdateChecker()

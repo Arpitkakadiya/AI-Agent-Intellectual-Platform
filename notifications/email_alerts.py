@@ -119,10 +119,47 @@ Intelligence Platform
         body = self._send_welcome_email_body(jurisdiction_name=jurisdiction_name)
         _smtp_send(to_email=email, subject=subject, body=body)
 
+    def _send_unsubscribe_email_body(self, jurisdiction_name: str) -> str:
+        return f"""
+You have been unsubscribed from email alerts for {jurisdiction_name} housing regulation updates.
+
+You will no longer receive:
+- Automatic notifications when regulations change for {jurisdiction_name}
+- Daily digest emails for this jurisdiction (if enabled for your account)
+
+You can subscribe again anytime from the Email Alerts page in the Intelligence Platform.
+
+{settings.LEGAL_DISCLAIMER}
+
+---
+Intelligence Platform
+""".strip()
+
+    def send_unsubscribe_confirmation_email(
+        self, email: str, jurisdiction_name: str
+    ) -> None:
+        subject = (
+            f"Unsubscribed: Housing Regulation Alerts for {jurisdiction_name}"
+        )
+        body = self._send_unsubscribe_email_body(jurisdiction_name=jurisdiction_name)
+        _smtp_send(to_email=email, subject=subject, body=body)
+
     def subscribe(self, email: str, jurisdiction_id: int) -> dict[str, Any]:
         db = get_db()
         jurisdiction_id = int(jurisdiction_id)
         jurisdiction_name = self._get_jurisdiction_name(db, jurisdiction_id)
+
+        prior = (
+            db.table("email_subscriptions")
+            .select("is_active")
+            .eq("email", email)
+            .eq("jurisdiction_id", jurisdiction_id)
+            .limit(1)
+            .execute()
+        )
+        already_active = bool(
+            prior.data and prior.data[0].get("is_active") is True
+        )
 
         try:
             db.table("email_subscriptions").upsert(
@@ -134,7 +171,6 @@ Intelligence Platform
                     }
                 ],
                 on_conflict="email,jurisdiction_id",
-                ignore_duplicates=True,
             ).execute()
         except Exception as exc:
             msg = str(exc)
@@ -146,19 +182,32 @@ Intelligence Platform
                 ) from exc
             raise
 
-        try:
-            self.send_welcome_email(email=email, jurisdiction_name=jurisdiction_name)
-        except Exception:
-            pass
+        if not already_active:
+            try:
+                self.send_welcome_email(
+                    email=email, jurisdiction_name=jurisdiction_name
+                )
+            except Exception:
+                pass
 
         return {"status": "subscribed"}
 
     def unsubscribe(self, email: str, jurisdiction_id: int) -> dict[str, Any]:
         db = get_db()
+        jurisdiction_id = int(jurisdiction_id)
+        jurisdiction_name = self._get_jurisdiction_name(db, jurisdiction_id)
+        # postgrest2.x: `.update()` returns a filter builder with no `.select()`.
+        # Detect an active row first, then PATCH without relying on RETURNING.
         try:
-            db.table("email_subscriptions").update({"is_active": False}).eq(
-                "email", email
-            ).eq("jurisdiction_id", int(jurisdiction_id)).execute()
+            existing = (
+                db.table("email_subscriptions")
+                .select("id")
+                .eq("email", email)
+                .eq("jurisdiction_id", jurisdiction_id)
+                .eq("is_active", True)
+                .limit(1)
+                .execute()
+            )
         except Exception as exc:
             msg = str(exc)
             if "permission denied" in msg.lower() or "42501" in msg:
@@ -168,6 +217,30 @@ Intelligence Platform
                     "or switch SUPABASE_KEY to the service_role key."
                 ) from exc
             raise
+        rows = existing.data or []
+        if not rows:
+            return {"status": "not_found"}
+        try:
+            db.table("email_subscriptions").update({"is_active": False}).eq(
+                "email", email
+            ).eq("jurisdiction_id", jurisdiction_id).eq(
+                "is_active", True
+            ).execute()
+        except Exception as exc:
+            msg = str(exc)
+            if "permission denied" in msg.lower() or "42501" in msg:
+                raise PermissionError(
+                    "Database permission denied for email_subscriptions. "
+                    "Run the RLS policy SQL from LOCAL_DEVELOPMENT.md step 6, "
+                    "or switch SUPABASE_KEY to the service_role key."
+                ) from exc
+            raise
+        try:
+            self.send_unsubscribe_confirmation_email(
+                email=email, jurisdiction_name=jurisdiction_name
+            )
+        except Exception:
+            pass
         return {"status": "unsubscribed"}
 
     def get_active_subscriptions(self, email: str) -> list[dict[str, Any]]:
@@ -216,7 +289,10 @@ Intelligence Platform
         if not isinstance(update, UpdateResult):
             update = UpdateResult.model_validate(update)
 
-        affected_ids = [int(x) for x in (update.affected_jurisdictions or [])]
+        affected_ids = [
+            int(x)
+            for x in (getattr(update, "affected_jurisdiction_ids", None) or [])
+        ]
         if not affected_ids:
             return
 
