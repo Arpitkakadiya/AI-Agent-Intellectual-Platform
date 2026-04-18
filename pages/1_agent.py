@@ -10,7 +10,8 @@ from core.rag.qa_system import qa
 from core.rag.utils import deduplicate_sources
 from db.client import get_db
 from db.models import Jurisdiction
-from ui_theme import apply_theme, page_header
+from core.regulations.scraper import is_supabase_connected
+from ui_theme import apply_theme, callout_box, cross_page_link, log_activity, page_hero, section_heading, setup_banner
 
 COMPLIANCE_KEYWORDS = ("compliant", "compliance", "check", "review my", "analyze my")
 FILE_BYTES_KEY = "uploaded_file_bytes"
@@ -42,16 +43,17 @@ def _clear_chat() -> None:
             del st.session_state[key]
 
 
+_DEFAULT_STATES: list[Jurisdiction] = [
+    Jurisdiction(id=1, type="state", name="California", state_code="CA"),
+    Jurisdiction(id=2, type="state", name="Colorado", state_code="CO"),
+    Jurisdiction(id=3, type="state", name="Florida", state_code="FL"),
+    Jurisdiction(id=4, type="state", name="New York", state_code="NY"),
+    Jurisdiction(id=5, type="state", name="Texas", state_code="TX"),
+]
+
+
 def _load_states() -> list[Jurisdiction]:
-    db = get_db()
-    res = (
-        db.table("jurisdictions")
-        .select("id,type,name,parent_id,state_code,fips_code")
-        .eq("type", "state")
-        .order("name")
-        .execute()
-    )
-    return [Jurisdiction.model_validate(row) for row in (res.data or [])]
+    return list(_DEFAULT_STATES)
 
 
 def _load_cities(state_id: int) -> list[Jurisdiction]:
@@ -67,98 +69,108 @@ def _load_cities(state_id: int) -> list[Jurisdiction]:
     return [Jurisdiction.model_validate(row) for row in (res.data or [])]
 
 
-def _show_agent_sidebar_extras() -> None:
-    """Extra sidebar widgets specific to the agent page (jurisdiction + document upload)."""
-    with st.sidebar:
-        st.divider()
-        st.caption("JURISDICTION")
+def _show_controls() -> None:
+    """Render jurisdiction selector and document upload side-by-side on the main page."""
+    col_jurisdiction, col_upload = st.columns(2)
 
-        try:
+    # ── Jurisdiction ──
+    with col_jurisdiction:
+        with st.container(border=True):
+            st.markdown(
+                '<div style="display:flex;align-items:center;gap:0.625rem;margin-bottom:0.5rem;">'
+                '<span style="font-size:1.15rem;">📍</span>'
+                '<div>'
+                '<div style="font-weight:600;font-size:0.9rem;color:var(--rc-text);">Jurisdiction</div>'
+                '<div style="font-size:0.75rem;color:var(--rc-text-muted);">State and city for your query</div>'
+                '</div></div>',
+                unsafe_allow_html=True,
+            )
+
             states = _load_states()
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Failed to load jurisdictions: {exc}")
-            states = []
 
-        if not states:
-            st.session_state[JURISDICTION_KEY] = None
-            st.selectbox("State", options=["No states available"], index=0, disabled=True)
-            st.selectbox("City (optional)", options=["No cities available"], index=0, disabled=True)
-        else:
-            state_options = {s.name: int(s.id or 0) for s in states}
-            default_state_name = states[0].name
-            existing_state_id = st.session_state.get(SELECTED_STATE_KEY)
-            for s in states:
-                if int(s.id or 0) == existing_state_id:
-                    default_state_name = s.name
-                    break
+            if states:
+                state_options = {s.name: int(s.id or 0) for s in states}
+                default_state_name = states[0].name
+                existing_state_id = st.session_state.get(SELECTED_STATE_KEY)
+                for s in states:
+                    if int(s.id or 0) == existing_state_id:
+                        default_state_name = s.name
+                        break
 
-            selected_state_name = st.selectbox(
-                "State",
-                options=list(state_options.keys()),
-                index=list(state_options.keys()).index(default_state_name),
-            )
-            selected_state_id = state_options[selected_state_name]
-            st.session_state[SELECTED_STATE_KEY] = selected_state_id
-
-            try:
-                cities = _load_cities(selected_state_id)
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Failed to load cities: {exc}")
-                cities = []
-
-            city_options: dict[str, Optional[int]] = {"Statewide (no city)": None}
-            for c in cities:
-                city_options[c.name] = int(c.id or 0)
-
-            existing_city_id = st.session_state.get(SELECTED_CITY_KEY)
-            default_city_name = "Statewide (no city)"
-            for name, city_id in city_options.items():
-                if city_id == existing_city_id:
-                    default_city_name = name
-                    break
-
-            selected_city_name = st.selectbox(
-                "City (optional)",
-                options=list(city_options.keys()),
-                index=list(city_options.keys()).index(default_city_name),
-            )
-            selected_city_id = city_options[selected_city_name]
-            st.session_state[SELECTED_CITY_KEY] = selected_city_id
-            st.session_state[JURISDICTION_KEY] = selected_city_id or selected_state_id
-
-        st.divider()
-        st.caption("DOCUMENT REVIEW")
-
-        uploaded = st.file_uploader(
-            "Upload lease or document",
-            type=["pdf", "docx", "doc"],
-            accept_multiple_files=False,
-            help="PDF or DOCX for compliance analysis",
-        )
-
-        if uploaded is not None:
-            file_bytes = uploaded.getvalue()
-            old_name = st.session_state.get(FILE_NAME_KEY)
-            if old_name and uploaded.name != old_name:
-                st.session_state[CHAT_KEY].append(
-                    {
-                        "role": "assistant",
-                        "content": f"📄 Document changed from **{old_name}** to **{uploaded.name}**. "
-                        "Future questions will reference the new document.",
-                        "sources": [],
-                    }
+                selected_state_name = st.selectbox(
+                    "State",
+                    options=list(state_options.keys()),
+                    index=list(state_options.keys()).index(default_state_name),
                 )
-            st.session_state[FILE_BYTES_KEY] = file_bytes
-            st.session_state[FILE_NAME_KEY] = uploaded.name
-            st.session_state[FILE_SIZE_KEY] = uploaded.size
+                selected_state_id = state_options[selected_state_name]
+                st.session_state[SELECTED_STATE_KEY] = selected_state_id
 
-        if FILE_BYTES_KEY in st.session_state and FILE_NAME_KEY in st.session_state:
-            fname = st.session_state[FILE_NAME_KEY]
-            fsize = st.session_state.get(FILE_SIZE_KEY, 0)
-            st.success(f"📄 **{fname}** ({int(fsize) / 1024:.1f} KB)")
+                try:
+                    cities = _load_cities(selected_state_id)
+                except Exception:  # noqa: BLE001
+                    cities = []
 
-        st.divider()
-        st.caption(config.LEGAL_DISCLAIMER)
+                city_options: dict[str, Optional[int]] = {"Statewide (no city)": None}
+                for c in cities:
+                    city_options[c.name] = int(c.id or 0)
+
+                existing_city_id = st.session_state.get(SELECTED_CITY_KEY)
+                default_city_name = "Statewide (no city)"
+                for name, city_id in city_options.items():
+                    if city_id == existing_city_id:
+                        default_city_name = name
+                        break
+
+                selected_city_name = st.selectbox(
+                    "City (optional)",
+                    options=list(city_options.keys()),
+                    index=list(city_options.keys()).index(default_city_name),
+                )
+                selected_city_id = city_options[selected_city_name]
+                st.session_state[SELECTED_CITY_KEY] = selected_city_id
+                st.session_state[JURISDICTION_KEY] = selected_city_id or selected_state_id
+
+    # ── Document Upload ──
+    with col_upload:
+        with st.container(border=True):
+            st.markdown(
+                '<div style="display:flex;align-items:center;gap:0.625rem;margin-bottom:0.5rem;">'
+                '<span style="font-size:1.15rem;">📄</span>'
+                '<div>'
+                '<div style="font-weight:600;font-size:0.9rem;color:var(--rc-text);">Document Review</div>'
+                '<div style="font-size:0.75rem;color:var(--rc-text-muted);">Upload a lease or contract for compliance analysis</div>'
+                '</div></div>',
+                unsafe_allow_html=True,
+            )
+
+            uploaded = st.file_uploader(
+                "Upload lease or document",
+                type=["pdf", "docx", "doc"],
+                accept_multiple_files=False,
+                help="PDF or DOCX for compliance analysis",
+                label_visibility="collapsed",
+            )
+
+            if uploaded is not None:
+                file_bytes = uploaded.getvalue()
+                old_name = st.session_state.get(FILE_NAME_KEY)
+                if old_name and uploaded.name != old_name:
+                    st.session_state[CHAT_KEY].append(
+                        {
+                            "role": "assistant",
+                            "content": f"Document changed from **{old_name}** to **{uploaded.name}**. "
+                            "Future questions will reference the new document.",
+                            "sources": [],
+                        }
+                    )
+                st.session_state[FILE_BYTES_KEY] = file_bytes
+                st.session_state[FILE_NAME_KEY] = uploaded.name
+                st.session_state[FILE_SIZE_KEY] = uploaded.size
+
+            if FILE_BYTES_KEY in st.session_state and FILE_NAME_KEY in st.session_state:
+                fname = st.session_state[FILE_NAME_KEY]
+                fsize = st.session_state.get(FILE_SIZE_KEY, 0)
+                st.success(f"**{fname}** ({int(fsize) / 1024:.1f} KB)")
 
 
 def _get_active_file() -> Optional[dict[str, Any]]:
@@ -242,7 +254,7 @@ def _should_run_compliance_review(prompt: str) -> bool:
 def _handle_message(prompt: str, active_file: Optional[dict[str, Any]]) -> None:
     jurisdiction_id = st.session_state.get(JURISDICTION_KEY)
     if jurisdiction_id is None:
-        st.warning("Please select a state (and optional city) first.")
+        callout_box("📍", "Please select a state above before asking a question.", "warning")
         return
 
     file_present = active_file is not None
@@ -282,8 +294,11 @@ def _handle_message(prompt: str, active_file: Optional[dict[str, Any]]) -> None:
                         sources = list(result.sources)
                         sources.insert(0, {"source": active_file["name"], "url": ""})
                         st.session_state[COMPLIANCE_DONE_KEY] = True
-                    except Exception as exc:  # noqa: BLE001
-                        answer = f"Compliance check failed: {exc}"
+                        log_activity("Compliance review", active_file["name"])
+                        st.toast("Compliance review complete", icon="✅")
+                    except Exception:  # noqa: BLE001
+                        answer = "Something went wrong during the compliance review. Please check your API key settings and try again."
+                        st.toast("Compliance review failed", icon="❌")
         elif file_present:
             with st.spinner("Analyzing document..."):
                 try:
@@ -295,8 +310,9 @@ def _handle_message(prompt: str, active_file: Optional[dict[str, Any]]) -> None:
                     )
                     answer = str(qa_result.get("answer") or "")
                     sources = list(qa_result.get("sources") or [])
-                except Exception as exc:  # noqa: BLE001
-                    answer = f"Unable to answer about the document: {exc}"
+                    log_activity("Document Q&A", prompt[:60])
+                except Exception:  # noqa: BLE001
+                    answer = "Unable to analyze the document right now. Please verify your API keys are configured in Settings."
         else:
             with st.spinner("Thinking..."):
                 try:
@@ -307,14 +323,16 @@ def _handle_message(prompt: str, active_file: Optional[dict[str, Any]]) -> None:
                     )
                     answer = str(qa_result.get("answer") or "")
                     sources = list(qa_result.get("sources") or [])
-                except Exception as exc:  # noqa: BLE001
-                    answer = f"Unable to answer right now: {exc}"
+                    log_activity("Asked question", prompt[:60])
+                except Exception:  # noqa: BLE001
+                    answer = "Unable to process your question right now. Please check that your AI provider is configured in Settings."
 
         st.markdown(answer)
         deduped_sources = deduplicate_sources(sources)
         _render_sources(deduped_sources)
-        if any(k in answer.lower() for k in ("new law", "update", "regulation")):
-            st.info("Want alerts for new regulations? Subscribe on the Email Alerts page.")
+
+    if any(k in answer.lower() for k in ("new law", "update", "regulation")):
+        cross_page_link("📧", "Want alerts for new regulations? Subscribe to Email Alerts →", "pages/4_email_alerts.py")
 
     assistant_message = {
         "role": "assistant",
@@ -331,40 +349,137 @@ def _render_history() -> None:
             st.markdown(str(msg.get("content", "")))
             if role == "assistant":
                 _render_sources(list(msg.get("sources") or []))
-                text = str(msg.get("content", "")).lower()
-                if any(k in text for k in ("new law", "update", "regulation")):
-                    st.info("Want alerts for new regulations? Subscribe on the Email Alerts page.")
 
 
 def _render_empty_state() -> None:
-    st.write("")
-    st.markdown("#### 💬 Compliance Assistant")
-    st.write(
-        "Ask questions about housing regulations, review lease compliance, "
-        "or explore regulatory requirements."
-    )
-    st.write("")
+    st.markdown('<div class="rc-cards-heading">Try one of these to get started</div>', unsafe_allow_html=True)
 
-    examples = [
-        ("🌐 Regulation Q&A", "What are the latest rent control regulations in California?"),
-        ("🔒 Lease Compliance", "What notice period is required for lease termination in NYC?"),
-        ("📄 Document Review", "Does my lease comply with fair housing requirements?"),
+    cards = [
+        (
+            "🌐", "blue", "Regulation Q&A",
+            "Ask about any housing regulation — rent control, eviction rules, tenant rights, and more.",
+            "What are the latest rent control regulations in California?",
+        ),
+        (
+            "🔒", "green", "Lease Compliance",
+            "Get answers on notice periods, required disclosures, and legal obligations for landlords.",
+            "What notice period is required for lease termination in NYC?",
+        ),
+        (
+            "📄", "amber", "Document Review",
+            "Upload a lease or contract and I'll check it against applicable regulations.",
+            "Does my lease comply with fair housing requirements?",
+        ),
     ]
 
-    for label, text in examples:
-        with st.container(border=True):
-            if st.button(f"**{label}** — {text}", key=f"ex_{label}", use_container_width=True):
-                st.session_state[PENDING_PROMPT_KEY] = text
+    cols = st.columns(3)
+    for i, (icon, color, label, desc, example_text) in enumerate(cards):
+        with cols[i]:
+            with st.container(border=True):
+                st.markdown(
+                    f'<div class="rc-prompt-card-v2">'
+                    f'<div class="rc-prompt-card-v2-icon-wrap {color}">{icon}</div>'
+                    f'<div class="rc-prompt-card-v2-label">{label}</div>'
+                    f'<div class="rc-prompt-card-v2-desc">{desc}</div>'
+                    f'<div class="rc-prompt-card-v2-example">"{example_text}"</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                if st.button(f"Ask this →", key=f"ex_{label}", use_container_width=True):
+                    st.session_state[PENDING_PROMPT_KEY] = example_text
+                    st.rerun()
+
+    quick_questions = [
+        "What disclosures must landlords provide?",
+        "Explain security deposit limits",
+        "Eviction notice requirements",
+        "Fair housing protected classes",
+    ]
+    pill_cols = st.columns(len(quick_questions))
+    for i, q in enumerate(quick_questions):
+        with pill_cols[i]:
+            if st.button(q, key=f"pill_{i}", use_container_width=True):
+                st.session_state[PENDING_PROMPT_KEY] = q
                 st.rerun()
+
+
+def _render_onboarding() -> None:
+    """Show a getting-started banner when the platform isn't fully configured."""
+    db_ok = False
+    try:
+        db_ok = is_supabase_connected()
+    except Exception:  # noqa: BLE001
+        pass
+
+    llm_ok = (
+        config.settings.has_anthropic_key
+        or config.settings.has_openai_key
+        or config.settings.has_google_key
+    )
+    jurisdiction_ok = st.session_state.get(JURISDICTION_KEY) is not None
+
+    setup_banner([
+        (db_ok, "Connect database", "Add your Supabase URL and key in Settings"),
+        (llm_ok, "Configure an AI provider", "Add an API key for Anthropic, OpenAI, or Google"),
+        (jurisdiction_ok, "Select a jurisdiction", "Choose a state (and optional city) at the top of the page"),
+    ])
 
 
 def show_agent_page() -> None:
     _init_state()
     apply_theme()
-    _show_agent_sidebar_extras()
-    page_header("Compliance Agent", "AI-powered regulatory Q&A and document analysis")
+    with st.sidebar:
+        st.markdown(
+            f'<div style="font-size:0.7rem;color:var(--rc-text-muted);line-height:1.4;'
+            f'padding:0.5rem 0.25rem;margin-top:1rem;">{config.LEGAL_DISCLAIMER}</div>',
+            unsafe_allow_html=True,
+        )
+    page_hero("💬", "Compliance Agent", "AI-powered regulatory Q&A and document analysis — ask questions, review leases, and get citation-backed answers.", "indigo")
+
+    st.markdown(
+        '<div class="rc-hero">'
+        '<div class="rc-hero-logo">⚖️</div>'
+        '<div class="rc-hero-title">How can I help with compliance today?</div>'
+        '<div class="rc-hero-subtitle">'
+        'I can answer questions about housing regulations, review lease documents '
+        'for compliance issues, and keep you informed about regulatory changes.'
+        '</div>'
+        '<div class="rc-hero-capabilities">'
+        '<span class="rc-hero-cap"><span class="rc-hero-cap-dot"></span>Multi-jurisdiction</span>'
+        '<span class="rc-hero-cap"><span class="rc-hero-cap-dot"></span>Document analysis</span>'
+        '<span class="rc-hero-cap"><span class="rc-hero-cap-dot"></span>Real-time updates</span>'
+        '</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    _show_controls()
+
+    _render_onboarding()
 
     active_file = _get_active_file()
+
+    if active_file and not st.session_state.get(COMPLIANCE_DONE_KEY):
+        with st.container(border=True):
+            col_info, col_btn = st.columns([3, 1])
+            with col_info:
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:0.75rem;">'
+                    f'<span style="font-size:1.5rem;">📄</span>'
+                    f'<div>'
+                    f'<div style="font-weight:600;font-size:0.95rem;">{active_file["name"]}</div>'
+                    f'<div style="font-size:0.78rem;color:var(--rc-text-muted);">'
+                    f'Ready for compliance analysis &middot; {int(active_file["size"]) / 1024:.1f} KB</div>'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with col_btn:
+                if st.button("Run Compliance Review", type="primary", use_container_width=True, key="btn_compliance_direct"):
+                    st.session_state[PENDING_PROMPT_KEY] = f"Review {active_file['name']} for compliance issues"
+                    st.rerun()
+
+    if st.session_state.get(JURISDICTION_KEY) is None and not st.session_state[CHAT_KEY]:
+        callout_box("📍", "Select a jurisdiction above to start asking questions.", "warning")
 
     if st.session_state[CHAT_KEY]:
         _render_history()
@@ -377,15 +492,28 @@ def show_agent_page() -> None:
         st.rerun()
 
     if st.session_state[CHAT_KEY]:
-        if st.button("🗑️ Clear conversation"):
-            _clear_chat()
-            st.rerun()
+        _, col_clear, _ = st.columns([3, 1, 3])
+        with col_clear:
+            if st.button("Clear conversation", key="btn_clear_chat", use_container_width=True):
+                _clear_chat()
+                st.rerun()
 
-    placeholder = "Ask about housing regulations..."
     if active_file is not None:
-        placeholder = f"Ask a question about {active_file['name']}..."
+        placeholder = f"Ask anything about {active_file['name']}, or type 'compliance check' to review it..."
+    elif st.session_state[CHAT_KEY]:
+        placeholder = "Follow up, or ask a new question..."
+    else:
+        placeholder = "Ask about rent control, lease requirements, tenant rights, or any housing regulation..."
 
     prompt = st.chat_input(placeholder=placeholder)
+
+    hint = (
+        'Tip: Be specific — include the <strong>state or city</strong> and the '
+        '<strong>topic</strong> for the best answers. '
+        'E.g. "What are NYC rent stabilization rules for renewals?"'
+    )
+    st.markdown(f'<div class="rc-input-hint">{hint}</div>', unsafe_allow_html=True)
+
     if prompt:
         _handle_message(prompt, active_file)
         st.rerun()

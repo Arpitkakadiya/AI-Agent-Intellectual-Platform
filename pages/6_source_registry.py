@@ -7,7 +7,7 @@ from typing import Any
 import streamlit as st
 
 from db.client import get_db
-from ui_theme import apply_theme, page_header
+from ui_theme import apply_theme, metric_card, page_hero, section_heading
 
 _REGISTRY_AVAILABLE = False
 try:
@@ -59,14 +59,26 @@ def _find_jurisdiction_index(jurisdictions: list[dict], jid: int) -> int:
 # ---------------------------------------------------------------------------
 
 def _show_unavailable() -> None:
-    st.title("Source Registry")
-    st.info(
-        "Source registry is not available. "
-        "Run migration **007_regulation_sources.sql** and grant permissions "
-        "(see `LOCAL_DEVELOPMENT.md` step 6) to enable it."
+    st.markdown(
+        '<div class="rc-empty-state">'
+        '<div class="rc-empty-state-icon">🗂️</div>'
+        '<div class="rc-empty-state-title">Source Registry Unavailable</div>'
+        '<div class="rc-empty-state-desc">'
+        'This feature requires additional database setup. '
+        'Please contact your administrator or check the setup guide.'
+        '</div></div>',
+        unsafe_allow_html=True,
     )
-    if st.button("Retry", key="btn_retry_avail"):
-        st.rerun()
+    with st.expander("Technical details"):
+        st.code(
+            "Run migration 007_regulation_sources.sql and grant permissions.\n"
+            "See LOCAL_DEVELOPMENT.md step 6 for details.",
+            language="text",
+        )
+    _, col_btn, _ = st.columns([2, 1, 2])
+    with col_btn:
+        if st.button("Retry", key="btn_retry_avail", use_container_width=True, type="primary"):
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -82,20 +94,26 @@ def _section_header(all_sources: list[dict[str, Any]]) -> None:
     never_scraped = sum(1 for s in all_sources if not s.get("last_scraped_at"))
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total", total)
-    m2.metric("Active", active)
-    m3.metric("Errors", errored)
-    m4.metric("Never scraped", never_scraped)
+    with m1:
+        st.markdown(metric_card("Total Sources", str(total), "📊"), unsafe_allow_html=True)
+    with m2:
+        st.markdown(metric_card("Active", str(active), "✅"), unsafe_allow_html=True)
+    with m3:
+        st.markdown(metric_card("Errors", str(errored), "⚠️"), unsafe_allow_html=True)
+    with m4:
+        st.markdown(metric_card("Never Scraped", str(never_scraped), "🕐"), unsafe_allow_html=True)
 
-    st.markdown("---")
+    st.markdown('<div style="height:1rem;"></div>', unsafe_allow_html=True)
 
     col_toggle, col_import, col_export = st.columns([3, 1, 1])
 
     with col_toggle:
         provider_label = "Database" if db_enabled else "CSV file"
         st.markdown(
-            "**Source provider:** `" + provider_label + "`"
-            " — where the scraper reads source URLs from."
+            f'<div style="font-size:0.85rem;">'
+            f'<strong>Source provider:</strong> <code>{provider_label}</code> — '
+            f'where the scraper reads source URLs from.</div>',
+            unsafe_allow_html=True,
         )
         new_val = st.toggle("Use database source registry", value=db_enabled, key="sr_toggle")
         if new_val != db_enabled:
@@ -188,10 +206,10 @@ def _pagination_bar(total: int) -> tuple[int, int]:
             st.rerun()
     with col_info:
         st.markdown(
-            "<div style='text-align:center; padding-top:6px;'>"
-            "Page <b>" + str(current) + "</b> of <b>" + str(total_pages) +
-            "</b> &nbsp;·&nbsp; " + str(total) + " source(s)"
-            "</div>",
+            '<div style="text-align:center;padding-top:6px;font-size:0.85rem;color:var(--rc-text-muted);">'
+            'Page <b style="color:var(--rc-text);">' + str(current) + '</b> of <b style="color:var(--rc-text);">'
+            + str(total_pages) + '</b> &nbsp;&middot;&nbsp; ' + str(total) + ' source(s)'
+            '</div>',
             unsafe_allow_html=True,
         )
     with col_next:
@@ -341,10 +359,28 @@ def _render_source_card(src: dict[str, Any]) -> None:
                     err_detail = probe.get("error") or ("HTTP " + str(probe.get("status_code")))
                     st.error("Failed: " + err_detail)
 
-            if st.button("Delete", key="sr_del_" + str(sid), use_container_width=True):
-                with st.spinner("Deleting..."):
-                    source_registry.delete_source(sid)
-                st.rerun()
+            confirm_key = "sr_confirm_del_" + str(sid)
+            if st.session_state.get(confirm_key):
+                st.markdown(
+                    '<div style="font-size:0.78rem;color:var(--rc-danger);font-weight:600;text-align:center;">'
+                    'Are you sure?</div>',
+                    unsafe_allow_html=True,
+                )
+                dc1, dc2 = st.columns(2)
+                with dc1:
+                    if st.button("Yes, delete", key="sr_del_yes_" + str(sid), use_container_width=True):
+                        with st.spinner("Deleting..."):
+                            source_registry.delete_source(sid)
+                        st.session_state.pop(confirm_key, None)
+                        st.rerun()
+                with dc2:
+                    if st.button("Cancel", key="sr_del_no_" + str(sid), use_container_width=True):
+                        st.session_state.pop(confirm_key, None)
+                        st.rerun()
+            else:
+                if st.button("Delete", key="sr_del_" + str(sid), use_container_width=True):
+                    st.session_state[confirm_key] = True
+                    st.rerun()
 
         # Scrape history (collapsed sub-section)
         with st.expander("Scrape history", expanded=False):
@@ -364,22 +400,35 @@ def _tab_sources(all_sources: list[dict[str, Any]]) -> None:
     # Filters
     filtered = _apply_filters(all_sources)
 
-    # Bulk actions row
     ba1, ba2, ba3 = st.columns([1, 1, 4])
+
     with ba1:
-        if st.button("Activate all shown", key="sr_bulk_act", use_container_width=True):
-            with st.spinner("Activating sources..."):
-                for s in filtered:
-                    if not s.get("is_active"):
-                        source_registry.toggle_source_active(s["id"], True)
-            st.rerun()
+        if st.session_state.get("sr_confirm_bulk_act"):
+            if st.button("Confirm activate", key="sr_bulk_act_yes", use_container_width=True):
+                with st.spinner("Activating sources..."):
+                    for s in filtered:
+                        if not s.get("is_active"):
+                            source_registry.toggle_source_active(s["id"], True)
+                st.session_state.pop("sr_confirm_bulk_act", None)
+                st.rerun()
+        else:
+            if st.button("Activate all shown", key="sr_bulk_act", use_container_width=True):
+                st.session_state["sr_confirm_bulk_act"] = True
+                st.rerun()
+
     with ba2:
-        if st.button("Deactivate all shown", key="sr_bulk_deact", use_container_width=True):
-            with st.spinner("Deactivating sources..."):
-                for s in filtered:
-                    if s.get("is_active"):
-                        source_registry.toggle_source_active(s["id"], False)
-            st.rerun()
+        if st.session_state.get("sr_confirm_bulk_deact"):
+            if st.button("Confirm deactivate", key="sr_bulk_deact_yes", use_container_width=True):
+                with st.spinner("Deactivating sources..."):
+                    for s in filtered:
+                        if s.get("is_active"):
+                            source_registry.toggle_source_active(s["id"], False)
+                st.session_state.pop("sr_confirm_bulk_deact", None)
+                st.rerun()
+        else:
+            if st.button("Deactivate all shown", key="sr_bulk_deact", use_container_width=True):
+                st.session_state["sr_confirm_bulk_deact"] = True
+                st.rerun()
 
     if not filtered:
         st.info("No sources match your filters.")
@@ -409,9 +458,9 @@ def _pagination_bar_bottom(total: int, page_idx: int, page_size: int) -> None:
             st.rerun()
     with col_info:
         st.markdown(
-            "<div style='text-align:center; padding-top:6px;'>"
-            "Page <b>" + str(current) + "</b> of <b>" + str(total_pages) + "</b>"
-            "</div>",
+            '<div style="text-align:center;padding-top:6px;font-size:0.85rem;color:var(--rc-text-muted);">'
+            'Page <b style="color:var(--rc-text);">' + str(current) + '</b> of <b style="color:var(--rc-text);">'
+            + str(total_pages) + '</b></div>',
             unsafe_allow_html=True,
         )
     with col_next:
@@ -474,7 +523,7 @@ def _tab_add_source() -> None:
 
 def show_page() -> None:
     apply_theme()
-    page_header("Source Registry", "Manage regulation source URLs that the scraper monitors")
+    page_hero("🗂️", "Source Registry", "Manage regulation source URLs that the scraper monitors — add, edit, test, and track scrape history.", "blue")
 
     if not _REGISTRY_AVAILABLE or source_registry is None:
         _show_unavailable()

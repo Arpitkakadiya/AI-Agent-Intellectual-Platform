@@ -8,69 +8,17 @@ import streamlit as st
 import config
 from core.llm.client import llm
 from core.regulations.scraper import is_supabase_connected, scraper
-from ui_theme import apply_theme, page_header, section_heading
+from ui_theme import apply_theme, page_hero, section_heading, status_dot
 
 
 def _csv_path() -> Path:
     return Path(__file__).resolve().parents[1] / "data" / "seeds" / "sources.csv"
 
 
-# ── Data Management ───────────────────────────────────────────
-
-def _section_data_management() -> None:
-    section_heading("📦 Data Management")
-
-    col_csv, col_index = st.columns(2)
-
-    with col_csv:
-        with st.container(border=True):
-            st.markdown("**📑 Load Regulations**")
-            st.caption("Import regulation data from CSV file")
-            if st.button("Load from CSV", key="btn_csv", use_container_width=True, type="primary"):
-                with st.spinner("Loading regulations from CSV..."):
-                    try:
-                        result = scraper.load_regulations_from_csv(csv_path=_csv_path())
-                        st.success(
-                            f"Loaded {result.get('loaded', 0)} regulations, "
-                            f"skipped {result.get('skipped', 0)} duplicates."
-                        )
-                    except Exception as exc:
-                        st.error(f"Failed to load regulations: {exc}")
-
-    with col_index:
-        with st.container(border=True):
-            st.markdown("**🔍 Vector Index**")
-            st.caption("Initialize or rebuild the search index")
-            if st.button("Initialize Index", key="btn_index", use_container_width=True):
-                with st.spinner("Building vector index..."):
-                    try:
-                        result = scraper.initialize_vector_index()
-                        st.success(
-                            f"Vector index initialized for {result.get('indexed_docs', 0)} "
-                            f"unindexed regulations (doc count)."
-                        )
-                    except Exception as exc:
-                        st.error(f"Failed to initialize vector index: {exc}")
-
-
-# ── Source Management ─────────────────────────────────────────
-
-def _section_source_management() -> None:
-    section_heading("📋 Source Management")
-
-    with st.container(border=True):
-        col_info, col_link = st.columns([3, 1])
-        with col_info:
-            st.markdown("**Source Registry**")
-            st.caption("Manage regulation source URLs and scraping configurations")
-        with col_link:
-            st.page_link("pages/6_source_registry.py", label="Open Registry →", icon="📋")
-
-
 # ── System Health ─────────────────────────────────────────────
 
 def _section_system_health() -> None:
-    section_heading("✨ System Health")
+    section_heading("System Health")
 
     supabase_ok = is_supabase_connected()
 
@@ -84,54 +32,114 @@ def _section_system_health() -> None:
     except Exception:
         vec_ok = False
 
-    c1, c2, c3, c4 = st.columns(4)
+    llm_ok = (
+        config.settings.has_anthropic_key
+        or config.settings.has_openai_key
+        or config.settings.has_google_key
+    )
 
-    with c1:
-        with st.container(border=True):
-            st.markdown("**Regulation API**")
-            dot = "rc-dot-green" if supabase_ok else "rc-dot-red"
-            label = "Operational" if supabase_ok else "Unavailable"
-            st.markdown(f'<span class="rc-dot {dot}"></span>{label}', unsafe_allow_html=True)
+    services = [
+        ("Regulation API", supabase_ok, ""),
+        ("Vector Index", vec_ok, vec_detail),
+        ("LLM Provider", llm_ok, "" if llm_ok else " (no key)"),
+        ("Scraper Service", True, ""),
+    ]
 
-    with c2:
-        with st.container(border=True):
-            st.markdown("**Vector Index**")
-            dot = "rc-dot-green" if vec_ok else "rc-dot-red"
-            label = ("Operational" if vec_ok else "Unavailable") + vec_detail
-            st.markdown(f'<span class="rc-dot {dot}"></span>{label}', unsafe_allow_html=True)
+    cols = st.columns(4)
+    for i, (name, ok, detail) in enumerate(services):
+        with cols[i]:
+            with st.container(border=True):
+                st.markdown(
+                    f'<div class="rc-status-card">'
+                    f'<div class="rc-status-card-label">{name}</div>'
+                    f'{status_dot(ok, ("Operational" if ok else "Unavailable") + detail)}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
-    with c3:
-        with st.container(border=True):
-            st.markdown("**LLM Provider**")
-            llm_ok = (
-                config.settings.has_anthropic_key
-                or config.settings.has_openai_key
-                or config.settings.has_google_key
-            )
-            dot = "rc-dot-green" if llm_ok else "rc-dot-red"
-            label = "Operational" if llm_ok else "No API key"
-            st.markdown(f'<span class="rc-dot {dot}"></span>{label}', unsafe_allow_html=True)
 
-    with c4:
+# ── Data Management ───────────────────────────────────────────
+
+def _section_data_management() -> None:
+    section_heading("Data Management")
+
+    col_csv, col_index = st.columns(2)
+
+    with col_csv:
         with st.container(border=True):
-            st.markdown("**Scraper Service**")
             st.markdown(
-                '<span class="rc-dot rc-dot-green"></span>Operational',
+                '<div style="font-size:1.25rem;margin-bottom:0.25rem;">📑</div>'
+                '<div style="font-weight:600;font-size:0.95rem;">Load Regulations</div>'
+                '<div style="font-size:0.78rem;color:var(--rc-text-muted);margin-bottom:0.75rem;">'
+                'Import regulation data from CSV file</div>',
                 unsafe_allow_html=True,
             )
+            if st.button("Load from CSV", key="btn_csv", use_container_width=True, type="primary"):
+                with st.spinner("Loading regulations from CSV..."):
+                    try:
+                        result = scraper.load_regulations_from_csv(csv_path=_csv_path())
+                        st.success(
+                            f"Loaded {result.get('loaded', 0)} regulations, "
+                            f"skipped {result.get('skipped', 0)} duplicates."
+                        )
+                    except Exception:
+                        st.error("Could not load regulations. Please verify the CSV file exists and your database connection is active.")
+
+    with col_index:
+        with st.container(border=True):
+            st.markdown(
+                '<div style="font-size:1.25rem;margin-bottom:0.25rem;">🔍</div>'
+                '<div style="font-weight:600;font-size:0.95rem;">Vector Index</div>'
+                '<div style="font-size:0.78rem;color:var(--rc-text-muted);margin-bottom:0.75rem;">'
+                'Initialize or rebuild the search index</div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("Initialize Index", key="btn_index", use_container_width=True):
+                with st.spinner("Building vector index..."):
+                    try:
+                        result = scraper.initialize_vector_index()
+                        st.success(
+                            f"Vector index initialized for {result.get('indexed_docs', 0)} "
+                            f"unindexed regulations (doc count)."
+                        )
+                    except Exception:
+                        st.error("Could not initialize the vector index. Please ensure the database is connected and regulations have been loaded.")
+
+
+# ── Source Management ─────────────────────────────────────────
+
+def _section_source_management() -> None:
+    section_heading("Source Management")
+
+    with st.container(border=True):
+        col_info, col_link = st.columns([3, 1])
+        with col_info:
+            st.markdown(
+                '<div style="font-weight:600;font-size:0.95rem;">Source Registry</div>'
+                '<div style="font-size:0.78rem;color:var(--rc-text-muted);">'
+                'Manage regulation source URLs and scraping configurations</div>',
+                unsafe_allow_html=True,
+            )
+        with col_link:
+            st.page_link("pages/6_source_registry.py", label="Open Registry →", icon="📋")
 
 
 # ── Configuration ─────────────────────────────────────────────
 
 def _section_configuration() -> None:
-    section_heading("⚙️ Configuration")
+    section_heading("Configuration")
 
     col_llm, col_scraper = st.columns(2)
 
     with col_llm:
         with st.container(border=True):
-            st.markdown("**🤖 LLM Provider**")
-            st.caption("AI model for compliance analysis")
+            st.markdown(
+                '<div style="font-size:1.25rem;margin-bottom:0.25rem;">🤖</div>'
+                '<div style="font-weight:600;font-size:0.95rem;">LLM Provider</div>'
+                '<div style="font-size:0.78rem;color:var(--rc-text-muted);margin-bottom:0.75rem;">'
+                'AI model for compliance analysis</div>',
+                unsafe_allow_html=True,
+            )
 
             chat_options = ["auto", "anthropic", "openai", "gemini"]
             current_chat = st.session_state.get("chat_provider", config.settings.chat_provider)
@@ -176,8 +184,13 @@ def _section_configuration() -> None:
 
     with col_scraper:
         with st.container(border=True):
-            st.markdown("**▶️ Manual Scraper**")
-            st.caption("Trigger a manual scraping run")
+            st.markdown(
+                '<div style="font-size:1.25rem;margin-bottom:0.25rem;">▶️</div>'
+                '<div style="font-weight:600;font-size:0.95rem;">Manual Scraper</div>'
+                '<div style="font-size:0.78rem;color:var(--rc-text-muted);margin-bottom:0.75rem;">'
+                'Trigger a manual scraping run</div>',
+                unsafe_allow_html=True,
+            )
             if st.button("Run Scraper", key="btn_scrape", use_container_width=True, type="primary"):
                 with st.spinner("Running scraper — this may take a minute..."):
                     try:
@@ -188,18 +201,18 @@ def _section_configuration() -> None:
                         st.success(f"Scraped {scraped} sources, indexed {indexed} new versions.")
                         if errs:
                             st.warning(f"{len(errs)} error(s): {'; '.join(errs[:5])}")
-                    except Exception as exc:
-                        st.error(f"Manual scraper trigger failed: {exc}")
+                    except Exception:
+                        st.error("The scraper could not complete. Please check that source URLs are configured and the database is reachable.")
 
 
 # ── Page entry ────────────────────────────────────────────────
 
 def show_page() -> None:
     apply_theme()
-    page_header("Settings", "System configuration, data management, and service health")
+    page_hero("⚙️", "Settings", "System configuration, data management, and service health — manage providers, data, and scraping.", "slate")
+    _section_system_health()
     _section_data_management()
     _section_source_management()
-    _section_system_health()
     _section_configuration()
 
 
